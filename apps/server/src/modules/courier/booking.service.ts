@@ -1,0 +1,1266 @@
+import { Inject, Injectable, Logger, NotFoundException, type OnModuleInit } from '@nestjs/common';
+import { withGlobal, withOrg, type Tx } from '@elysium/db';
+import { sql } from 'drizzle-orm';
+import { businessDate, poisha } from '@elysium/domain';
+import { normalizeStatus, statusDedupeKey, type ParcelInput } from '@elysium/domain/courier';
+
+import type { AuditableRequest } from '../../platform/audit/audit.interceptor.js';
+import { AuditService } from '../../platform/audit/audit.service.js';
+import { assertInScope } from '../../platform/auth/scope.js';
+import { emit } from '../../platform/events/outbox.js';
+import { enqueue } from '../../platform/jobs/enqueue.js';
+import type { ActiveContext } from '../../platform/http/context.js';
+import {
+  COURIER_ADAPTERS,
+  type AdapterContext,
+  type CourierAdapterRegistry,
+} from './adapters/courier-adapter.js';
+import { adapterEnabled, courierEnv } from './courier.config.js';
+import { CourierError, databaseCourierCode } from './courier.errors.js';
+import * as repo from './courier.repository.js';
+import {
+  COURIER_QUEUES,
+  type BookParcelPayload,
+  type CancelParcelPayload,
+  type RecordHandoverPayload,
+} from './courier.queues.js';
+import { openCredentials } from './credentials.js';
+import { CourierBookingRegistry } from '../orders/ports/courier-booking.port.js';
+import { ParcelObserverRegistry } from '../orders/ports/parcel-observer.port.js';
+import { ORDERS_PORT, type OrdersPort } from './ports/orders.port.js';
+
+/**
+ * Booking a parcel, and the job that actually does it (architecture §9, §20; invariant 6).
+ *
+ * ## The shape invariant 6 forces
+ *
+ * Booking is an HTTP call to a courier. It may not happen inside the transaction that
+ * confirms or packs the order, because that transaction holds a database connection and a
+ * courier's slow afternoon would become our outage. So the flow is in two halves and the
+ * seam between them is a pg-boss row:
+ *
+ *  1. `reserveConsignment(tx, …)` — **inside** the caller's transaction. It writes the
+ *     consignment row in `pending` and enqueues `delivery.book_parcel` with
+ *     `enqueue(tx, …)`. Both commit with the order's status change, or neither does. An
+ *     order that rolled back has no parcel queued; an order that committed has exactly one.
+ *  2. `runBooking(job)` — in the worker, with **no** transaction open. It reads what it
+ *     needs, calls the courier, and then opens its own short transaction to record the
+ *     answer.
+ *
+ * Nothing in this file calls an adapter inside a `withOrg`, and the two halves are separate
+ * methods rather than one with a flag precisely so that reading it makes the rule obvious.
+ *
+ * ## Why the courier call sits between two transactions and not inside one
+ *
+ * The uncomfortable consequence is a window in which the courier has the parcel and we have
+ * not recorded its number. §9 closes it by requiring `createParcel` to be idempotent on our
+ * reference: the retry gets the same consignment number back rather than creating a second
+ * parcel. That is the property that makes at-least-once delivery safe here, and it is why
+ * `markBooked` is written to be a no-op when the number already matches.
+ */
+
+/** An order at or past its handover: a parcel booked for it is already with the rider. */
+const SHIPPED_OR_LATER: readonly string[] = [
+  'shipped',
+  'delivered',
+  'partially_delivered',
+  'return_in_transit',
+  'returned',
+  'exchange',
+];
+
+export interface BookingOutcome {
+  readonly consignmentId: string;
+  readonly enqueued: boolean;
+}
+
+/**
+ * The statuses a person may book from: confirmed or packed, and shipped for a parcel booked
+ * after it left (rebooked after a failure, or shipped before it was booked; D-903's audit W1).
+ */
+const DESK_BOOKABLE: readonly string[] = ['confirmed', 'packed', 'shipped'];
+
+/** D-1026: what a parcel entered by hand may be at the courier: not picked up yet. */
+const LINKABLE_STATUSES: readonly string[] = ['booked', 'pickup_pending'];
+
+/** D-1026: what a person reads when the courier already holds the parcel we could not record. */
+export function parcelExistsMessage(courierName: string, reference: string): string {
+  return `${courierName} already has a parcel for ${reference}: an earlier try reached ${courierName} but its answer did not come back, so it was not sent again. Find ${reference} in ${courierName}'s panel and enter its consignment ID here (cancel any duplicates there).`.slice(
+    0,
+    500,
+  );
+}
+
+@Injectable()
+export class BookingService implements OnModuleInit {
+  private readonly logger = new Logger(BookingService.name);
+
+  constructor(
+    @Inject(COURIER_ADAPTERS) private readonly adapters: CourierAdapterRegistry,
+    @Inject(ORDERS_PORT) private readonly orders: OrdersPort,
+    private readonly audit: AuditService,
+    private readonly bookings: CourierBookingRegistry,
+    // M46 (D-817): the packing module hears of each consignment, to print its labels.
+    private readonly parcels: ParcelObserverRegistry,
+  ) {}
+
+  /**
+   * Hand this service to the orders module, the way the settlements service hands its
+   * executor to the approvals module.
+   *
+   * §9's `enqueue_courier_booking` and `enqueue_courier_cancel` are effects of a transition
+   * and must run inside the transaction that moved the order, so the orders module has to
+   * reach this class — while `reserveConsignment` has to reach the orders module for the
+   * parcel's address. That is a provider cycle, not just a module one, and registration at
+   * startup is how this codebase already breaks it: one arrow (courier → orders) and a
+   * registry, rather than a `forwardRef` proxy around a cycle that is still there. See
+   * `modules/orders/ports/courier-booking.port.ts`.
+   */
+  onModuleInit(): void {
+    this.bookings.register(this);
+  }
+
+  /**
+   * Whether a parcel is live with a courier for this order (§9's cancel).
+   *
+   * `pending` counts. A booking job that has not run yet is a parcel the courier is about
+   * to be told about, and a cancel that ignored it would race the booking it is meant to
+   * undo — the cancel job finds nothing, the booking job then creates the parcel, and a
+   * cancelled order has a live consignment.
+   */
+  async hasLiveParcel(tx: Tx, orgId: string, orderId: string): Promise<boolean> {
+    const existing = await repo.consignmentByOrder(tx, orgId, orderId);
+    if (existing === undefined) return false;
+    return (
+      existing.booking_state === 'pending' ||
+      existing.booking_state === 'booked' ||
+      // D-1026: the courier holds a parcel for this order whose number we could not record. It
+      // is live to the courier, so an advance waits, the courier is not changed under it, and a
+      // cancel is sent (ledger audit C2, C3).
+      (existing.booking_state === 'failed' &&
+        existing.booking_failure_code === 'COURIER_PARCEL_EXISTS')
+    );
+  }
+
+  /**
+   * The order shipped, so its parcel went to the courier now (D-903): the handover time on the
+   * live consignment, unless one was recorded already (a person's Confirm handover stands). It is
+   * the clock "the courier has not received it" runs from. Written without waiting on the parcel's
+   * row (the ship holds the order's lock, and the courier's own status path locks the parcel
+   * first); when another transaction has the row at this instant, `delivery.record_handover`
+   * writes it after this one commits.
+   */
+  async recordHandover(
+    tx: Tx,
+    orgId: string,
+    orderId: string,
+    at: Date,
+    by: string,
+  ): Promise<void> {
+    const outcome = await repo.recordHandoverNow(tx, { orgId, orderId, at, by });
+    if (outcome !== 'locked') return;
+    const payload: RecordHandoverPayload = { orderId, at: at.toISOString(), by };
+    await enqueue(tx, COURIER_QUEUES.recordHandover, payload, { orgId, ref: orderId });
+  }
+
+  /** The worker's half of `recordHandover`: the handover, once, in its own transaction. */
+  async applyHandover(orgId: string, payload: RecordHandoverPayload): Promise<void> {
+    await withOrg({ orgId, userId: 'system:courier' }, async (tx) => {
+      const existing = await repo.consignmentByOrder(tx, orgId, payload.orderId);
+      if (existing === undefined) return;
+      if (existing.booking_state !== 'pending' && existing.booking_state !== 'booked') return;
+      const recorded = await repo.confirmHandover(tx, {
+        orgId,
+        consignmentId: existing.id,
+        at: new Date(payload.at),
+        by: payload.by,
+      });
+      if (!recorded) return;
+      await this.audit.record(tx, {
+        orgId,
+        actorUserId: null,
+        operation: 'update',
+        action: 'courier.handover.recorded',
+        entityType: 'Order',
+        entityId: payload.orderId,
+        before: { handoverConfirmedAt: null },
+        after: { consignmentId: existing.id, handoverConfirmedAt: payload.at, by: payload.by },
+      });
+    });
+  }
+
+  /** The booked parcel's codes, for the buyer's tracking (M34, D-524). Null before booking. */
+  async parcelTracking(
+    tx: Tx,
+    orgId: string,
+    orderId: string,
+  ): Promise<{
+    courierId: string;
+    consignmentNo: string | null;
+    trackingCode: string | null;
+  } | null> {
+    const parcel = await repo.consignmentByOrder(tx, orgId, orderId);
+    if (parcel?.booking_state !== 'booked') return null;
+    return {
+      courierId: parcel.courier_id,
+      consignmentNo: parcel.consignment_no,
+      trackingCode: parcel.tracking_code,
+    };
+  }
+
+  async ordersByParcelCode(tx: Tx, orgId: string, code: string): Promise<readonly string[]> {
+    return repo.ordersByParcelCode(tx, orgId, code);
+  }
+
+  /**
+   * Whether the order's parcel can be booked here (D-914): the test `reserveConsignment`'s
+   * automatic path makes (an active account for the order's courier, an adapter, switched on).
+   * A read, for a Confirm under booking by hand: its label then waits for the consignment.
+   */
+  async canBook(tx: Tx, orgId: string, orderId: string): Promise<boolean> {
+    // The courier it would be booked with: its own, else the brand's default (D-952).
+    const courierId = await this.orders.defaultCourierFor(tx, orgId, orderId);
+    if (courierId === null) return false;
+    const account = await repo.accountByCourier(tx, orgId, courierId);
+    if (account?.is_active !== true) return false;
+    const adapter = this.adapters.get(account.provider_code);
+    return adapter !== undefined && adapterEnabled(adapter);
+  }
+
+  /**
+   * Create the consignment row and queue the booking, inside the caller's transaction.
+   *
+   * The method the orders module's `enqueue_courier_booking` effect calls, and the method a
+   * desk's "book now" route calls for an org whose policy is `manual` (§9). Idempotent: an
+   * order that already has a live parcel returns it rather than creating a second one, and
+   * migration 0050's advisory-locked check refuses the second one anyway if two callers
+   * race.
+   */
+  async reserveConsignment(
+    tx: Tx,
+    actor: { orgId: string; userId: string; requestId?: string | null },
+    input: { orderId: string; courierId?: string | null; requireStatus?: readonly string[] },
+  ): Promise<BookingOutcome>;
+  /**
+   * `automatic`: the order's status change asks, under the brand's booking setting (D-901). An
+   * order whose courier cannot be booked here (no account, one switched off, no adapter, an
+   * unverified adapter switched off: an own rider, say) is then left to be booked by hand,
+   * `null`, rather than refusing the Confirm or the Pack it rides on.
+   */
+  async reserveConsignment(
+    tx: Tx,
+    actor: { orgId: string; userId: string; requestId?: string | null },
+    input: {
+      orderId: string;
+      courierId?: string | null;
+      automatic: true;
+      requireStatus?: readonly string[];
+    },
+  ): Promise<BookingOutcome | null>;
+  async reserveConsignment(
+    tx: Tx,
+    actor: { orgId: string; userId: string; requestId?: string | null },
+    input: {
+      orderId: string;
+      courierId?: string | null;
+      automatic?: boolean;
+      requireStatus?: readonly string[];
+    },
+  ): Promise<BookingOutcome | null> {
+    // Locked: the COD copied onto the consignment below must be the one an advance
+    // verification racing this booking either already lowered or will see as booked (D-231).
+    const order = await this.orders.bookingSnapshot(tx, actor.orgId, input.orderId, {
+      forUpdate: true,
+    });
+    if (order === null) {
+      throw new CourierError('ORDER_NOT_FOUND', 'No such order in this organization.');
+    }
+    // A person's Book (the desk, Stuck parcels' Book again) and the re-booking sweep say which
+    // statuses may still be booked, read here under the order's lock (ledger audit C1, W2): a
+    // failed booking of an order cancelled since must never become a live COD parcel. Not the
+    // transition effect's: it runs before the order's status is written (`transitions.service`).
+    if (input.requireStatus !== undefined && !input.requireStatus.includes(order.status)) {
+      throw new CourierError(
+        'CONSIGNMENT_INVALID',
+        `Order ${order.orderNo} is ${order.status}: it is not booked with a courier.`,
+      );
+    }
+
+    const existing = await repo.consignmentByOrder(tx, actor.orgId, input.orderId);
+    if (
+      existing !== undefined &&
+      (existing.booking_state === 'pending' || existing.booking_state === 'booked')
+    ) {
+      // Already going. Returning it rather than refusing, because the two callers that get
+      // here — the transition effect and the desk's button — both mean "make sure this is
+      // booked", and an error would make the desk's button unusable after a policy change.
+      return { consignmentId: existing.id, enqueued: false };
+    }
+
+    /*
+     * The parcel goes with **the order's** courier, and only that one (M15).
+     *
+     * §7's delivery journal debits `courier_receivable` against the order's `courier_id` —
+     * `TransitionsService.courierFor` takes the party from the order — while a settlement
+     * credits the *consignment's* courier. A parcel booked with any other courier therefore
+     * splits one COD across two parties: the order's courier carries a receivable no
+     * statement ever relieves, the parcel's courier goes negative by the same amount, and
+     * the org-wide total still balances, so nothing but a per-courier variance in the
+     * reconciliation report ever shows it. M12 let the desk name a different courier here
+     * ("overrides the order's own courier"), which did exactly that; M15's selection rules
+     * would have done it for every rule-routed parcel.
+     *
+     * So the rules decide the *order's* courier — the desk applies the recommendation from
+     * `GET /v1/courier/selection/preview` to the order, and the INTEGRATION notes ask the
+     * orders module to consult them when it takes an order — and booking only ever uses the
+     * courier the order already names. A different courier named here is refused with the fix.
+     */
+    // An order that names no courier goes with the brand's default (D-952): its zone's, else the
+    // one chosen in Settings → Couriers, else the brand's only courier. Written onto the order
+    // here, under the lock taken above, so the delivery is later posted against the same party.
+    const courierId =
+      order.courierId ?? (await this.orders.giveDefaultCourier(tx, actor, input.orderId));
+    if (courierId === null) {
+      throw new CourierError(
+        'CONSIGNMENT_INVALID',
+        'This brand has no default courier, so this order has none. Open Settings → Couriers and turn on “Use as the default courier” for your courier, then try again.',
+      );
+    }
+    if (
+      input.courierId !== undefined &&
+      input.courierId !== null &&
+      input.courierId !== courierId
+    ) {
+      throw new CourierError(
+        'CONSIGNMENT_INVALID',
+        'This order is set to a different courier. Change the order’s courier first: the delivery’s receivable is booked against it (§7).',
+      );
+    }
+    // The zone, copied onto the consignment so the performance report can group by it
+    // without reading `sales.orders`.
+    const facts = await this.orders.summary(tx, actor.orgId, input.orderId);
+    const deliveryZoneId = facts?.deliveryZoneId ?? null;
+
+    const account = await repo.accountByCourier(tx, actor.orgId, courierId);
+    const adapter = account === undefined ? undefined : this.adapters.get(account.provider_code);
+    if (
+      input.automatic === true &&
+      (account?.is_active !== true || adapter === undefined || !adapterEnabled(adapter))
+    ) {
+      return null;
+    }
+    if (account === undefined) {
+      throw new CourierError(
+        'COURIER_ACCOUNT_NOT_FOUND',
+        'That courier has no account set up in this organization.',
+      );
+    }
+    if (!account.is_active) {
+      throw new CourierError('COURIER_ACCOUNT_INVALID', 'That courier account is not active.');
+    }
+    if (adapter === undefined) {
+      throw new CourierError(
+        'COURIER_ACCOUNT_INVALID',
+        `No adapter is built for "${account.provider_code}".`,
+      );
+    }
+    if (!adapterEnabled(adapter)) {
+      /*
+       * An unverified adapter whose switch is off. Refused here, inside the transaction that
+       * would have queued the booking, so no job is ever created for a courier the
+       * installation has not agreed to trust (M15: the switch is read at every use).
+       */
+      throw new CourierError(
+        'COURIER_ACCOUNT_INVALID',
+        `The ${adapter.code} adapter is UNVERIFIED and switched off; set COURIER_${adapter.code.toUpperCase()}_ENABLED=true to book with it.`,
+      );
+    }
+
+    const consignmentId = await repo.insertConsignment(tx, {
+      orgId: actor.orgId,
+      orderId: order.orderId,
+      courierAccountId: account.id,
+      courierId,
+      branchId: order.branchId,
+      // The order *number*, not its id. It is what the courier echoes on a settlement sheet
+      // and what the settlement matcher's secondary key compares against, and a uuid on a
+      // printed manifest is unreadable.
+      reference: order.orderNo,
+      codAmountPoisha: order.codAmountPoisha,
+      createdBy: actor.userId,
+      deliveryZoneId,
+    });
+
+    // Booked after the order shipped (rebooked after a failure, or shipped before it was booked):
+    // the parcel is already with the rider, so its handover is now (D-903's audit, W1).
+    const now = await this.orders.statusOf(tx, actor.orgId, order.orderId);
+    if (now !== null && SHIPPED_OR_LATER.includes(now.status)) {
+      await repo.confirmHandover(tx, {
+        orgId: actor.orgId,
+        consignmentId,
+        at: new Date(),
+        by: actor.userId,
+      });
+    }
+
+    /*
+     * The line invariant 6 exists for.
+     *
+     * `enqueue(tx, …)` writes the job through the caller's transaction, so the parcel is
+     * queued if and only if the order's status change commits. `singletonKey` collapses a
+     * second enqueue for the same consignment while one is still queued, which is what
+     * makes it safe for two paths to both mean "make sure this is booked".
+     */
+    const payload: BookParcelPayload = {
+      consignmentId,
+      orderId: order.orderId,
+      actorUserId: actor.userId,
+    };
+    await enqueue(tx, COURIER_QUEUES.book, payload, {
+      orgId: actor.orgId,
+      ref: consignmentId,
+      requestId: actor.requestId ?? null,
+      singletonKey: `book:${consignmentId}`,
+    });
+
+    return { consignmentId, enqueued: true };
+  }
+
+  /**
+   * D-1024: the bookings that ran out of retries because the courier did not answer (Steadfast's
+   * timeouts on 2026-11-11: five retries in four and a half minutes, then nothing), booked again
+   * every quarter hour for a day after the order's first booking. Only an order still confirmed:
+   * its label waits for the booking. Each is its own transaction, so one refusal leaves the rest;
+   * `reserveConsignment` writes a new consignment and enqueues it (no courier call here).
+   */
+  async rebookFailed(): Promise<number> {
+    const orgIds = await withGlobal(async (tx) =>
+      (
+        await tx.execute<{ id: string }>(
+          sql`select id from org.organizations where is_active order by slug`,
+        )
+      ).map((row) => row.id),
+    );
+    let queued = 0;
+    for (const orgId of orgIds) {
+      const actor = { orgId, userId: repo.REBOOK_BY };
+      let candidates: { order_id: string }[];
+      try {
+        candidates = await withOrg(actor, (tx) => repo.rebookCandidates(tx, orgId, 50));
+      } catch (error) {
+        this.logger.warn(
+          `re-booking sweep of org ${orgId} failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+        continue;
+      }
+      for (const candidate of candidates) {
+        try {
+          const outcome = await withOrg(actor, async (tx) => {
+            const now = await this.orders.statusOf(tx, orgId, candidate.order_id);
+            if (now?.status !== 'confirmed') return null;
+            // Checked again under the order's lock (ledger audit W2): a cancel in between wins.
+            const booked = await this.reserveConsignment(tx, actor, {
+              orderId: candidate.order_id,
+              automatic: true,
+              requireStatus: ['confirmed'],
+            }).catch((error: unknown) => {
+              if (error instanceof CourierError && error.code === 'CONSIGNMENT_INVALID')
+                return null;
+              throw error;
+            });
+            if (booked?.enqueued === true) {
+              await this.audit.record(tx, {
+                orgId,
+                actorUserId: null,
+                operation: 'create',
+                action: 'courier.booking.retried',
+                entityType: 'Order',
+                entityId: candidate.order_id,
+                before: { bookingState: 'failed' },
+                after: { consignmentId: booked.consignmentId, automatic: true },
+              });
+            }
+            return booked;
+          });
+          if (outcome?.enqueued === true) queued += 1;
+        } catch (error) {
+          this.logger.warn(
+            `re-booking an order of org ${orgId} failed: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      }
+    }
+    return queued;
+  }
+
+  /** The desk's "book this now" route, for an org whose policy is `manual` (§9). */
+  async bookFromDesk(
+    context: ActiveContext,
+    request: AuditableRequest,
+    input: { orderId: string; courierId?: string | undefined },
+  ): Promise<BookingOutcome> {
+    return withOrg({ orgId: context.orgId, userId: context.userId }, async (tx) => {
+      /*
+       * §6's branch narrowing, before the row exists.
+       *
+       * The order's branch is the parcel's branch, so it is what the caller's scope is
+       * checked against — and it has to be checked *before* `reserveConsignment`, because
+       * that method writes the consignment and enqueues the courier call. The scope backstop
+       * answers 500 for a route that never applies scope, which is how this omission
+       * surfaced: a branch manager booking another showroom's parcel is the thing it is
+       * there to stop.
+       */
+      const order = await this.orders.statusOf(tx, context.orgId, input.orderId);
+      if (order === null) {
+        throw new CourierError('ORDER_NOT_FOUND', 'No such order in this organization.');
+      }
+      assertInScope(request, { branchId: order.branchId });
+
+      const outcome = await this.reserveConsignment(
+        tx,
+        { orgId: context.orgId, userId: context.userId, requestId: context.requestId },
+        {
+          orderId: input.orderId,
+          courierId: input.courierId ?? null,
+          requireStatus: DESK_BOOKABLE,
+        },
+      );
+
+      await this.audit.record(tx, {
+        orgId: context.orgId,
+        actorUserId: context.userId,
+        operation: 'create',
+        action: 'courier.booking.queued',
+        entityType: 'Order',
+        entityId: input.orderId,
+        before: null,
+        after: { consignmentId: outcome.consignmentId, enqueued: outcome.enqueued },
+        requestId: context.requestId,
+        request,
+      });
+
+      return outcome;
+    });
+  }
+
+  /**
+   * Book many orders from the desk at once (M15's bulk booking).
+   *
+   * One transaction **per order**, not one for the batch. A batch transaction would make one
+   * order with a bad address roll back the forty good ones beside it, and the desk would have
+   * to find the bad one by bisecting. Each order is scope-checked, reserved and enqueued on
+   * its own, and the answer says what happened to every one.
+   *
+   * No courier is called here — each reservation enqueues `delivery.book_parcel` in its own
+   * transaction, exactly as the single booking does (invariant 6).
+   */
+  async bookMany(
+    context: ActiveContext,
+    request: AuditableRequest,
+    input: { orderIds: readonly string[]; courierId?: string | undefined },
+  ): Promise<{
+    results: readonly {
+      orderId: string;
+      consignmentId: string | null;
+      enqueued: boolean;
+      code: string | null;
+    }[];
+  }> {
+    const results: {
+      orderId: string;
+      consignmentId: string | null;
+      enqueued: boolean;
+      code: string | null;
+    }[] = [];
+
+    // Distinct, in the order given: a pasted list with a repeat is one booking, not two.
+    for (const orderId of [...new Set(input.orderIds)]) {
+      try {
+        const outcome = await this.bookFromDesk(context, request, {
+          orderId,
+          ...(input.courierId === undefined ? {} : { courierId: input.courierId }),
+        });
+        results.push({
+          orderId,
+          consignmentId: outcome.consignmentId,
+          enqueued: outcome.enqueued,
+          code: null,
+        });
+      } catch (error) {
+        /*
+         * One order's refusal is that order's answer. An order outside the caller's scope
+         * answers exactly as a missing one does, so a bulk request cannot be used to learn
+         * which ids exist in another branch.
+         */
+        const code =
+          error instanceof CourierError
+            ? error.code
+            : error instanceof NotFoundException
+              ? 'ORDER_NOT_FOUND'
+              : (databaseCourierCode(error)?.code ?? null);
+        if (code === null) throw error;
+        results.push({ orderId, consignmentId: null, enqueued: false, code });
+      }
+    }
+
+    return { results };
+  }
+
+  /**
+   * D-1026: a failed booking given the parcel the courier already holds for it, by a person who
+   * read its consignment id off the courier's panel (an earlier try reached the courier and its
+   * answer never came, so nothing is sent again). The courier is asked about the number first,
+   * outside any transaction (invariant 6): a number it does not know on this account is refused.
+   * Then, under the order's lock, the failed row becomes the order's booked parcel: 0050's trigger
+   * still refuses a second live parcel and the unique index a number another order carries.
+   */
+  async linkConsignment(
+    context: ActiveContext,
+    request: AuditableRequest,
+    consignmentId: string,
+    input: { consignmentNo: string },
+  ): Promise<{ consignmentId: string; consignmentNo: string }> {
+    const orgId = context.orgId;
+    const actor = { orgId, userId: context.userId };
+    const consignmentNo = input.consignmentNo.trim();
+
+    const prepared = await withOrg(actor, async (tx) => {
+      const consignment = await repo.consignmentById(tx, orgId, consignmentId);
+      if (consignment === undefined) {
+        throw new CourierError('CONSIGNMENT_NOT_FOUND', 'No such parcel in this organization.');
+      }
+      const order = await this.orders.statusOf(tx, orgId, consignment.order_id);
+      if (order === null) {
+        throw new CourierError('CONSIGNMENT_NOT_FOUND', 'No such parcel in this organization.');
+      }
+      assertInScope(request, { branchId: order.branchId });
+      if (consignment.booking_state !== 'failed') {
+        throw new CourierError(
+          'CONSIGNMENT_INVALID',
+          'Only a booking that failed takes a consignment ID by hand.',
+        );
+      }
+      if (!DESK_BOOKABLE.includes(order.status)) {
+        throw new CourierError(
+          'CONSIGNMENT_INVALID',
+          `Order ${consignment.reference} is ${order.status}: it is not booked with a courier.`,
+        );
+      }
+      if (await repo.consignmentNoTaken(tx, orgId, consignment.courier_account_id, consignmentNo)) {
+        throw new CourierError(
+          'CONSIGNMENT_ALREADY_BOOKED',
+          `Consignment ${consignmentNo} is already recorded for an order here. Check the number.`,
+        );
+      }
+      const account = await repo.accountById(tx, orgId, consignment.courier_account_id);
+      if (account === undefined) {
+        throw new CourierError('COURIER_ACCOUNT_NOT_FOUND', 'That courier account is gone.');
+      }
+      return { consignment, account };
+    });
+    const { consignment, account } = prepared;
+
+    const adapter = this.adapters.get(account.provider_code);
+    if (adapter === undefined || !adapterEnabled(adapter)) {
+      throw new CourierError(
+        'COURIER_ACCOUNT_INVALID',
+        `No adapter is switched on for "${account.provider_code}".`,
+      );
+    }
+    const adapterContext = this.adapterContext(orgId, account);
+    let answer: { rawStatus: string };
+    try {
+      // Steadfast's status call took 14 s on 2026-11-14: half a minute, a person is waiting.
+      answer = await adapter.getStatus(
+        { ...adapterContext, timeoutMs: Math.max(adapterContext.timeoutMs, 30_000) },
+        { consignmentNo, reference: consignment.reference, trackingCode: null },
+      );
+    } catch (error) {
+      if (
+        error instanceof CourierError &&
+        (error.code === 'CONSIGNMENT_NOT_FOUND' || error.code === 'COURIER_CREDENTIALS_MISSING')
+      ) {
+        // Steadfast answers 401 about a parcel that is not this account's (and about bad keys).
+        throw new CourierError(
+          'CONSIGNMENT_INVALID',
+          `${adapter.name} has no parcel ${consignmentNo} on this account (or the account's keys no longer work). Check the number in ${adapter.name}'s panel.`,
+        );
+      }
+      throw error;
+    }
+    const normalized = normalizeStatus(adapter.statusMap, answer.rawStatus);
+    // Only a parcel the courier has not picked up yet (ledger audit C4): a cancelled one is a
+    // duplicate, not the order's parcel, and one already on its way or finished would skip the
+    // order's own moves and journals. Those are a person's to sort out with the courier.
+    if (
+      !LINKABLE_STATUSES.includes(normalized.status) &&
+      // Steadfast's `in_review` (mapped to hold) is its word for booked, not yet at its hub (D-902).
+      answer.rawStatus.trim().toLowerCase() !== 'in_review'
+    ) {
+      throw new CourierError(
+        'CONSIGNMENT_INVALID',
+        `${adapter.name} says parcel ${consignmentNo} is "${answer.rawStatus}". Only a parcel ${adapter.name} has not picked up yet can be entered here; check the number.`,
+      );
+    }
+    const at = new Date();
+
+    await withOrg(actor, async (tx) => {
+      // Under the order's lock, as a booking is: a cancel in between wins.
+      const order = await this.orders.bookingSnapshot(tx, orgId, consignment.order_id, {
+        forUpdate: true,
+      });
+      if (order === null || !DESK_BOOKABLE.includes(order.status)) {
+        throw new CourierError(
+          'CONSIGNMENT_INVALID',
+          `Order ${consignment.reference} is ${order?.status ?? 'gone'}: it is not booked with a courier.`,
+        );
+      }
+      // The order's newest booking only (ledger audit W2): an older failed row made live beside a
+      // newer one would leave the order looking unbooked to a cancel.
+      const latest = await repo.consignmentByOrder(tx, orgId, consignment.order_id);
+      if (latest?.id !== consignment.id) {
+        throw new CourierError(
+          'CONSIGNMENT_INVALID',
+          'This order has been booked again since. Reload the order and enter the number on its newest booking.',
+        );
+      }
+      // The order's own courier (ledger audit C3): the delivery's receivable is booked against it.
+      if (order.courierId !== consignment.courier_id) {
+        throw new CourierError(
+          'CONSIGNMENT_INVALID',
+          'This order is set to a different courier now. Set it back to this courier first: the delivery’s receivable is booked against it.',
+        );
+      }
+      // The COD the courier holds is the one some attempt sent it; every attempt on this account
+      // must have sent the order's COD as it is now, or the courier collects the wrong amount
+      // (ledger audit C2).
+      const orderCod = BigInt(order.codAmountPoisha).toString();
+      const sent = await repo.orderConsignmentCods(
+        tx,
+        orgId,
+        consignment.order_id,
+        consignment.courier_account_id,
+      );
+      if (sent.some((cod) => cod !== orderCod)) {
+        throw new CourierError(
+          'CONSIGNMENT_INVALID',
+          `The order's COD changed after it was sent to ${adapter.name}, so parcel ${consignmentNo} carries the old amount. Cancel it in ${adapter.name}'s panel, then book the order again.`,
+        );
+      }
+      const linked = await repo.linkFailedConsignment(tx, {
+        orgId,
+        consignmentId: consignment.id,
+        consignmentNo,
+        rawStatus: answer.rawStatus,
+        status: normalized.status,
+        at,
+      });
+      if (!linked) {
+        throw new CourierError(
+          'CONSIGNMENT_INVALID',
+          'This booking changed meanwhile. Reload the order and look again.',
+        );
+      }
+      if (SHIPPED_OR_LATER.includes(order.status)) {
+        await repo.confirmHandover(tx, {
+          orgId,
+          consignmentId: consignment.id,
+          at,
+          by: context.userId,
+        });
+      }
+      await repo.insertConsignmentEvent(tx, {
+        orgId,
+        consignmentId: consignment.id,
+        source: 'manual',
+        status: normalized.status,
+        rawStatus: answer.rawStatus,
+        occurredAt: at,
+        businessDate: businessDate(at),
+        dedupeKey: statusDedupeKey({
+          consignmentId: consignment.id,
+          status: normalized.status,
+          occurredAt: at,
+        }),
+        payload: { consignmentNo, linkedBy: context.userId },
+        webhookDeliveryId: null,
+        appliedTrigger: null,
+        orderFromStatus: null,
+        orderToStatus: null,
+      });
+      // The label prints with the number, as for any booked parcel (M46, D-817); in a savepoint.
+      try {
+        await tx.transaction((savepoint) =>
+          this.parcels.notify(savepoint, {
+            orgId,
+            orderId: consignment.order_id,
+            consignmentNo,
+            at,
+          }),
+        );
+      } catch (error) {
+        this.logger.warn(
+          `a linked parcel's listeners failed for consignment ${consignment.id}: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+      await this.audit.record(tx, {
+        orgId,
+        actorUserId: context.userId,
+        operation: 'update',
+        action: 'courier.parcel.linked',
+        entityType: 'Order',
+        entityId: consignment.order_id,
+        before: { bookingState: 'failed', consignmentNo: null },
+        after: { bookingState: 'booked', consignmentNo },
+        requestId: context.requestId,
+        request,
+      });
+    });
+
+    return { consignmentId: consignment.id, consignmentNo };
+  }
+
+  /** Queue a cancellation with the courier, inside the caller's transaction (§9). */
+  async cancelConsignment(
+    tx: Tx,
+    actor: { orgId: string; userId: string; requestId?: string | null },
+    orderId: string,
+  ): Promise<{ consignmentId: string | null }> {
+    const existing = await repo.consignmentByOrder(tx, actor.orgId, orderId);
+    if (existing === undefined || existing.booking_state === 'cancelled') {
+      return { consignmentId: null };
+    }
+
+    const payload: CancelParcelPayload = {
+      consignmentId: existing.id,
+      actorUserId: actor.userId,
+    };
+    await enqueue(tx, COURIER_QUEUES.cancel, payload, {
+      orgId: actor.orgId,
+      ref: existing.id,
+      requestId: actor.requestId ?? null,
+      singletonKey: `cancel:${existing.id}`,
+    });
+    return { consignmentId: existing.id };
+  }
+
+  // --- the worker half ----------------------------------------------------------
+
+  /**
+   * Book one parcel. Runs in the worker, with no transaction open.
+   *
+   * Reads, calls, then writes. The read and the write are separate short transactions with
+   * the courier's network between them, which is the only arrangement invariant 6 allows —
+   * and the reason `markBooked` is conditional rather than a plain UPDATE: between the two,
+   * the same job may have been retried by another worker.
+   */
+  async runBooking(job: { orgId: string; payload: BookParcelPayload }): Promise<void> {
+    const { orgId, payload } = job;
+    const actor = { orgId, userId: payload.actorUserId };
+
+    const prepared = await withOrg(actor, async (tx) => {
+      const consignment = await repo.consignmentById(tx, orgId, payload.consignmentId);
+      if (consignment === undefined) {
+        // The order was cancelled and its transaction rolled back after the job was
+        // enqueued — impossible with `enqueue(tx, …)` — or somebody is replaying an old
+        // job. Either way there is nothing to book, and throwing would retry it five times.
+        return null;
+      }
+      if (consignment.booking_state === 'booked' || consignment.booking_state === 'cancelled') {
+        return null;
+      }
+
+      const account = await repo.accountById(tx, orgId, consignment.courier_account_id);
+      if (account === undefined) {
+        throw new CourierError('COURIER_ACCOUNT_NOT_FOUND', 'That courier account is gone.');
+      }
+      const order = await this.orders.bookingSnapshot(tx, orgId, consignment.order_id);
+      if (order === null) {
+        throw new CourierError('ORDER_NOT_FOUND', 'That order is gone.');
+      }
+      // D-1026: an attempt before this one (this job's, or an earlier booking of the order) may
+      // have reached the courier with its answer lost, so the courier is asked before sending.
+      // Counted before the call (ledger audit C1): an attempt that never reports back (a worker
+      // killed mid-call, an expired job) still tells the next one to ask first.
+      const mayHaveReached =
+        consignment.booking_attempts > 0 ||
+        (await repo.hasEarlierConsignment(tx, orgId, consignment.order_id, consignment.id));
+      await repo.markAttemptStarted(tx, orgId, consignment.id);
+      return { consignment, account, order, mayHaveReached };
+    });
+
+    if (prepared === null) return;
+    const { consignment, account, order, mayHaveReached } = prepared;
+
+    const adapter = this.adapters.get(account.provider_code);
+    if (adapter === undefined || !adapterEnabled(adapter)) {
+      /*
+       * No adapter, or an unverified one switched off since the booking was queued. Nothing
+       * any retry can change, so the parcel is flagged failed now rather than after five
+       * attempts — see the non-retryable branch below.
+       */
+      await this.reportBookingFailed({
+        orgId,
+        consignmentId: consignment.id,
+        code: 'COURIER_ACCOUNT_INVALID',
+      });
+      return;
+    }
+
+    const parcel: ParcelInput = {
+      reference: consignment.reference,
+      address: {
+        recipientName: order.recipientName,
+        recipientPhoneE164: order.recipientPhoneE164,
+        district: order.district,
+        thana: order.thana,
+        area: order.area,
+        addressLine: order.addressLine,
+      },
+      codAmountPoisha: poisha(BigInt(consignment.cod_amount_poisha)),
+      itemDescription: order.itemSummary,
+      note: order.notes,
+      // The order's weight when every variant in it is weighed (M39b, D-645); otherwise the
+      // adapter's configured default.
+      weightGrams: order.weightGrams,
+    };
+
+    /*
+     * D-1026: Steadfast's `create_order` is not idempotent on the invoice. On 2026-11-11 it answered
+     * after our timeout, five times, and each retry was another real parcel (ELY-2611-00242 and
+     * -00249 had six each). So when an earlier attempt may have reached the courier, ask it first:
+     * a parcel it already holds is never sent again; a person enters its consignment id instead.
+     * A courier that does not answer the question is a retry, never a guess.
+     */
+    if (mayHaveReached && adapter.parcelExists !== undefined) {
+      let exists: boolean;
+      try {
+        exists = await adapter.parcelExists(
+          this.adapterContext(orgId, account),
+          consignment.reference,
+        );
+      } catch (error) {
+        if (error instanceof CourierError && !error.retryable) {
+          await this.reportBookingFailed({
+            orgId,
+            consignmentId: consignment.id,
+            code: error.code,
+            message: error.message.slice(0, 500),
+          });
+          return;
+        }
+        await this.recordFailure(actor, consignment.id, error);
+        throw error;
+      }
+      if (exists) {
+        await this.reportBookingFailed({
+          orgId,
+          consignmentId: consignment.id,
+          code: 'COURIER_PARCEL_EXISTS',
+          message: parcelExistsMessage(adapter.name, consignment.reference),
+        });
+        return;
+      }
+    }
+
+    let result;
+    try {
+      // The outbound call. No transaction is open here, and that is the whole point.
+      result = await adapter.createParcel(this.adapterContext(orgId, account), parcel);
+    } catch (error) {
+      if (error instanceof CourierError && !error.retryable) {
+        /*
+         * A refusal no retry can change: the courier rejected the parcel, the credentials, or
+         * the COD (Pathao takes whole taka only). M12's comments said such a booking
+         * "dead-letters on the first attempt", but nothing read `retryable` — every refusal
+         * was re-thrown and pg-boss spent all five attempts, with backoff, before the order
+         * was flagged. So the flag is raised here, now, through the same
+         * `reportBookingFailed` the dead-letter handler uses, and the job completes: there is
+         * nothing left for it to do.
+         */
+        await this.reportBookingFailed({
+          orgId,
+          consignmentId: consignment.id,
+          code: error.code,
+          // The adapter's own sentence, which is written never to quote the courier's body.
+          message: error.message.slice(0, 500),
+        });
+        return;
+      }
+      await this.recordFailure(actor, consignment.id, error);
+      throw error;
+    }
+
+    const normalized = normalizeStatus(
+      adapter.statusMap,
+      result.rawStatus ?? Object.keys(adapter.statusMap.statuses)[0] ?? 'booked',
+    );
+
+    await withOrg(actor, async (tx) => {
+      const booked = await repo.markBooked(tx, {
+        orgId,
+        consignmentId: consignment.id,
+        consignmentNo: result.consignmentNo,
+        trackingCode: result.trackingCode,
+        rawStatus: result.rawStatus,
+        // A courier's own word for "created" maps to `booked` for most providers; when it
+        // maps to something else we take the courier's word, because it knows.
+        status: result.rawStatus === null ? 'booked' : normalized.status,
+        at: new Date(),
+      });
+      if (!booked) return;
+
+      const at = new Date();
+      await repo.insertConsignmentEvent(tx, {
+        orgId,
+        consignmentId: consignment.id,
+        source: 'poll',
+        status: result.rawStatus === null ? 'booked' : normalized.status,
+        rawStatus: result.rawStatus ?? 'booked',
+        occurredAt: at,
+        businessDate: businessDate(at),
+        dedupeKey: statusDedupeKey({
+          consignmentId: consignment.id,
+          status: result.rawStatus === null ? 'booked' : normalized.status,
+          occurredAt: at,
+        }),
+        payload: { consignmentNo: result.consignmentNo, trackingCode: result.trackingCode },
+        webhookDeliveryId: null,
+        appliedTrigger: null,
+        orderFromStatus: null,
+        orderToStatus: null,
+      });
+
+      // M46 (D-817): in this same transaction, so the label's print commits with the
+      // consignment it carries and is never a call from inside it (invariant 6). In a savepoint
+      // (ledger audit N5): the courier has already taken the parcel, so a failing listener
+      // loses its own rows (the labels are then printed by hand), never the booking.
+      try {
+        await tx.transaction((savepoint) =>
+          this.parcels.notify(savepoint, {
+            orgId,
+            orderId: consignment.order_id,
+            consignmentNo: result.consignmentNo,
+            at,
+          }),
+        );
+      } catch (error) {
+        this.logger.warn(
+          `a booked parcel's listeners failed for consignment ${consignment.id}: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+
+      await this.audit.record(tx, {
+        orgId,
+        actorUserId: payload.actorUserId,
+        operation: 'update',
+        action: 'courier.parcel.booked',
+        entityType: 'Order',
+        entityId: consignment.order_id,
+        before: { bookingState: consignment.booking_state },
+        after: { bookingState: 'booked', consignmentNo: result.consignmentNo },
+      });
+    });
+  }
+
+  /** Cancel one parcel with the courier. Runs in the worker. */
+  async runCancel(job: { orgId: string; payload: CancelParcelPayload }): Promise<void> {
+    const { orgId, payload } = job;
+    const actor = { orgId, userId: payload.actorUserId };
+
+    const prepared = await withOrg(actor, async (tx) => {
+      const consignment = await repo.consignmentById(tx, orgId, payload.consignmentId);
+      if (consignment === undefined || consignment.booking_state === 'cancelled') return null;
+      const account = await repo.accountById(tx, orgId, consignment.courier_account_id);
+      if (account === undefined) return null;
+      return { consignment, account };
+    });
+    if (prepared === null) return;
+
+    const adapter = this.adapters.get(prepared.account.provider_code);
+    // An unverified adapter switched off is not called at all (M15: the switch is read at every
+    // use). The parcel then comes back as a return, like one whose courier has no cancel.
+    if (adapter !== undefined && !adapterEnabled(adapter)) return;
+    // A courier with no cancel endpoint is not an error: §9 marks `cancelParcel` optional,
+    // and the parcel simply comes back as a return. Marking it cancelled on our side would
+    // be a lie about what the courier is holding.
+    if (adapter?.cancelParcel === undefined || prepared.consignment.consignment_no === null) {
+      return;
+    }
+
+    await adapter.cancelParcel(this.adapterContext(orgId, prepared.account), {
+      consignmentNo: prepared.consignment.consignment_no,
+      reference: prepared.consignment.reference,
+      trackingCode: prepared.consignment.tracking_code,
+    });
+
+    await withOrg(actor, async (tx) => {
+      await repo.markCancelled(tx, orgId, prepared.consignment.id);
+    });
+  }
+
+  /**
+   * Every retry spent (§20's dead letter; M12 acceptance check 6).
+   *
+   * Called by the dead-letter handler. Three things happen, and all three are the check:
+   * the consignment is flagged `failed` so the order desk can see why nothing is moving,
+   * `delivery.booking_failed` goes into the outbox for every org_admin (§19), and an audit
+   * row records it. The event carries ids and the failure code — never the courier's error
+   * body, which quotes the address and phone number we sent (§19, invariant 10).
+   */
+  async reportBookingFailed(input: {
+    orgId: string;
+    consignmentId: string;
+    code: string;
+    /** Why, when the caller knows better than "every attempt failed" (M15). */
+    message?: string;
+  }): Promise<void> {
+    const actor = { orgId: input.orgId, userId: 'system:courier' };
+    await withOrg(actor, async (tx) => {
+      const consignment = await repo.consignmentById(tx, input.orgId, input.consignmentId);
+      if (
+        consignment === undefined ||
+        consignment.booking_state === 'booked' ||
+        // Already flagged. A dead-letter redelivery must not raise a second alert for one
+        // failure, and a non-retryable refusal that already flagged it has said so once.
+        consignment.booking_state === 'failed' ||
+        consignment.booking_state === 'cancelled'
+      ) {
+        return;
+      }
+
+      await repo.recordBookingAttempt(tx, {
+        orgId: input.orgId,
+        consignmentId: input.consignmentId,
+        code: input.code,
+        message: input.message ?? repo.DEAD_LETTER_MESSAGE,
+        exhausted: true,
+      });
+
+      // D-914: no consignment is coming, so the label the confirm left waiting for one prints
+      // without it. In a savepoint, as a booked parcel's listeners are: a failing listener loses
+      // its own rows (the label is printed by hand), never the failure's flag.
+      try {
+        await tx.transaction((savepoint) =>
+          this.parcels.notifyBookingFailed(savepoint, {
+            orgId: input.orgId,
+            orderId: consignment.order_id,
+            at: new Date(),
+          }),
+        );
+      } catch (error) {
+        this.logger.warn(
+          `a failed booking's listeners failed for consignment ${consignment.id}: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+
+      // D-1024: an automatic re-booking that times out again, when the sweep will try once more,
+      // has said so already (the first failure's alert): recorded, without a fresh alert. Any
+      // other failure, or the last try, alerts (ledger audit W3).
+      if (
+        consignment.created_by === repo.REBOOK_BY &&
+        input.message === undefined &&
+        input.code === 'COURIER_BOOKING_FAILED' &&
+        (await repo.rebookWillRetry(tx, input.orgId, consignment.order_id))
+      ) {
+        await this.audit.record(tx, {
+          orgId: input.orgId,
+          actorUserId: null,
+          operation: 'update',
+          action: 'courier.booking.failed',
+          entityType: 'Order',
+          entityId: consignment.order_id,
+          before: { bookingState: consignment.booking_state },
+          after: { bookingState: 'failed', code: input.code, automatic: true },
+        });
+        return;
+      }
+      await emit(
+        tx,
+        'delivery.booking_failed',
+        {
+          orderId: consignment.order_id,
+          orderNo: consignment.reference,
+          consignmentId: consignment.id,
+          courierId: consignment.courier_id,
+          // An `ErrorCode`, never the courier's own message: its refusal body quotes the
+          // recipient's name, address and phone number, and this event reaches every
+          // org_admin through a socket that has no `serializeFor` in front of it
+          // (§19, invariant 10).
+          code: input.code,
+          attempts: consignment.booking_attempts,
+        },
+        { orgId: input.orgId },
+      );
+
+      await this.audit.record(tx, {
+        orgId: input.orgId,
+        actorUserId: null,
+        operation: 'update',
+        action: 'courier.booking.failed',
+        entityType: 'Order',
+        entityId: consignment.order_id,
+        before: { bookingState: consignment.booking_state },
+        after: { bookingState: 'failed', code: input.code },
+      });
+    });
+  }
+
+  /**
+   * Decrypt at the moment of use, and hold the plaintext no longer than the call.
+   *
+   * A field on the service would keep every org's keys in memory for the life of the
+   * process, where a heap dump or a `console.log` of `this` would have them all (§25).
+   */
+  private adapterContext(orgId: string, account: repo.CourierAccountRow): AdapterContext {
+    const credentials: Record<string, string> = {};
+    if (account.credentials !== null) {
+      Object.assign(
+        credentials,
+        openCredentials(account.credentials, {
+          orgId,
+          accountId: account.courier_id,
+          field: 'credentials',
+        }),
+      );
+    }
+    if (account.webhook_secret !== null) {
+      const opened = openCredentials(account.webhook_secret, {
+        orgId,
+        accountId: account.courier_id,
+        field: 'webhook_secret',
+      });
+      if (opened.webhookSecret !== undefined) {
+        credentials.webhookSecret = opened.webhookSecret;
+        // Steadfast's adapter calls it a bearer token; the fake calls it a secret. One
+        // stored value, both names, so an operator configures it once.
+        credentials.webhookToken ??= opened.webhookSecret;
+      }
+    }
+    return {
+      credentials: credentials,
+      baseUrl: account.base_url,
+      mode: account.mode,
+      timeoutMs: courierEnv().COURIER_HTTP_TIMEOUT_MS,
+    };
+  }
+
+  private async recordFailure(
+    actor: { orgId: string; userId: string },
+    consignmentId: string,
+    error: unknown,
+  ): Promise<void> {
+    const code = error instanceof CourierError ? error.code : 'COURIER_UNAVAILABLE';
+    await withOrg(actor, async (tx) => {
+      await repo.recordBookingAttempt(tx, {
+        orgId: actor.orgId,
+        consignmentId,
+        code,
+        // The adapter's own message, which is written not to quote the courier's body. The
+        // courier's body echoes the recipient's address and phone (invariant 10).
+        message: error instanceof Error ? error.message.slice(0, 500) : 'Unknown failure.',
+        exhausted: false,
+      });
+    });
+  }
+}

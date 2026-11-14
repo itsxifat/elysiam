@@ -1,0 +1,22 @@
+node_modules/
+dist/
+build/
+.next/
+.output/
+.wxt/
+.turbo/
+coverage/
+playwright-report/
+test-results/
+pnpm-lock.yaml
+docs/client-spec/
+packages/ui/src/assets/fonts/
+# The old website's discount engine, copied verbatim as a test oracle (M35a, D-540).
+packages/domain/src/promo/oracle/old-site-discounts.js
+# An editor's own settings, not the repository's.
+.vscode/
+# Committed unformatted by M49; a committed migration file is never edited (invariant 9).
+packages/db/migrations/meta/0161_snapshot.json
+packages/db/migrations/meta/0165_snapshot.json
+packages/db/migrations/meta/0166_snapshot.json
+packages/db/migrations/meta/0167_snapshot.json

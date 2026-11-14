@@ -1,0 +1,22 @@
+{
+  "name": "staff activity: a person’s timeline, one day",
+  "warmup": 2,
+  "samples": 20,
+  "min": 11.733040999999503,
+  "p50": 12.359832999994978,
+  "p95": 13.521666999993613,
+  "p99": 13.539415999999619,
+  "max": 13.539415999999619,
+  "mean": 12.41469984999785,
+  "budgetMs": null,
+  "withinBudget": null,
+  "environment": {
+    "commit": "2f6d6bfe",
+    "node": "v24.22.1",
+    "platform": "darwin arm64",
+    "cpu": "Apple M4",
+    "cores": 10,
+    "memoryGb": 16,
+    "at": "2026-11-13T05:45:23.450Z"
+  }
+}

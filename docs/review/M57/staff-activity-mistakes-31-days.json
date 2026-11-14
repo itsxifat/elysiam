@@ -1,0 +1,22 @@
+{
+  "name": "staff activity: mistakes, 31 days",
+  "warmup": 2,
+  "samples": 10,
+  "min": 1263.691709000006,
+  "p50": 1289.1537919999973,
+  "p95": 1546.8758329999982,
+  "p99": 1546.8758329999982,
+  "max": 1546.8758329999982,
+  "mean": 1320.1768291999992,
+  "budgetMs": null,
+  "withinBudget": null,
+  "environment": {
+    "commit": "2f6d6bfe",
+    "node": "v24.22.1",
+    "platform": "darwin arm64",
+    "cpu": "Apple M4",
+    "cores": 10,
+    "memoryGb": 16,
+    "at": "2026-11-13T05:45:39.336Z"
+  }
+}

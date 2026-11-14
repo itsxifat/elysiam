@@ -1,0 +1,247 @@
+import { ForbiddenException, Injectable, Module } from '@nestjs/common';
+import type { MembershipRole } from '@elysium/contracts';
+import type { Tx } from '@elysium/db';
+import { maskEmail } from '@elysium/domain';
+
+import {
+  activeMembers,
+  activeSuperAdmins,
+  activeRoleBranches,
+  membershipsOfUser,
+  ownersAmong,
+  peopleOfRecord,
+  lockPerson,
+  activeHere,
+} from './users.repository.js';
+
+/** Serialize assignment with deactivation; take these before locking assignment rows. */
+export async function lockPeopleForAssignment(tx: Tx, userIds: readonly string[]): Promise<void> {
+  for (const userId of [...new Set(userIds)].sort()) await lockPerson(tx, userId);
+}
+
+/**
+ * For a person taking work for themselves (a take, an accepted offer): the person lock, then
+ * whether they are still active here. A deactivation that committed while this request was on
+ * its way has released their work already, so what they take now would stay with a leaver.
+ */
+export async function lockSelfForAssignment(tx: Tx, orgId: string, userId: string): Promise<void> {
+  await lockPerson(tx, userId);
+  if (!(await activeHere(tx, orgId, userId))) {
+    throw new ForbiddenException({
+      code: 'FORBIDDEN',
+      message: 'Your access to this brand has ended.',
+    });
+  }
+}
+
+/**
+ * Identity's service interface for other modules (invariant 12, D-419).
+ *
+ * What another module needs from identity is "who in this brand could I link to this
+ * record": the employee form's sign-in picker and the investor's portal sign-in. Reading
+ * `iam.memberships` and `iam.users` straight from those modules would be new coupling the
+ * module-boundaries ratchet refuses, so they ask here.
+ *
+ * Deliberately narrow. A person comes back as an id, a name, the roles they hold in the
+ * brand and a **masked** email (`r***@brand.test`): enough to tell two people of the same
+ * name apart, and not a staff directory. Nothing about their sign-in (second factor, last
+ * sign-in, resets) leaves; that is the staff screen's, behind `read User`.
+ *
+ * Every method takes the caller's `Tx`, so the read joins the caller's `withOrg`
+ * transaction and is bound by its RLS context: another brand's memberships do not exist
+ * there.
+ */
+export interface BrandMember {
+  readonly userId: string;
+  readonly name: string;
+  readonly emailMasked: string;
+  readonly roles: readonly MembershipRole[];
+}
+
+/** An owner on a record (D-473): their name only for another owner, else null ("Owner"). */
+export interface OwnerOnRecord {
+  readonly userId: string;
+  readonly name: string | null;
+}
+
+/** A person a record names (D-898). */
+export interface StaffName {
+  readonly userId: string;
+  readonly name: string | null;
+  readonly owner: boolean;
+}
+
+export interface IamApi {
+  /**
+   * Which of these people are owners (M31, D-473), for a record that names who did what.
+   * An owner's name goes only to another owner; everyone else is told "Owner" (`name`
+   * null). Everyone not listed is a person the caller names the usual way.
+   */
+  ownersAmong(
+    tx: Tx,
+    userIds: readonly string[],
+    viewer: { readonly isOwner?: boolean | undefined },
+  ): Promise<readonly OwnerOnRecord[]>;
+
+  /**
+   * People with an enabled account and an active role in this brand, by name. With
+   * `roles`, only those holding one of them, and only those roles are reported: the
+   * caller asks for exactly the people its own grants concern.
+   */
+  activeMembers(
+    tx: Tx,
+    orgId: string,
+    options?: { readonly roles?: readonly MembershipRole[] },
+  ): Promise<readonly BrandMember[]>;
+
+  /**
+   * The name of everyone this brand's records may mention (D-898), for putting a name beside
+   * "taken by", "written by" or "asked by": whoever holds or ever held a role here and every
+   * super admin, enabled or not. An owner is "Owner" (D-473). Never for deciding who may act or
+   * be picked: `activeMembers` answers that.
+   */
+  nameBook(tx: Tx, orgId: string): Promise<ReadonlyMap<string, string>>;
+
+  /**
+   * The same people for one screen's ids (`GET /v1/staff-names`, D-898). An owner's name goes
+   * only to another owner (D-473): to everyone else `name` is null and `owner` true. An id
+   * this brand's records cannot mention is left out.
+   */
+  namesOf(
+    tx: Tx,
+    orgId: string,
+    userIds: readonly string[],
+    viewer: { readonly isOwner?: boolean | undefined },
+  ): Promise<readonly StaffName[]>;
+
+  /**
+   * The enabled super admins, who hold no role in a brand but may do anything in it (D-864),
+   * for a caller letting them do what a role's holder does. An owner is named "Owner" (D-473).
+   */
+  activeSuperAdmins(tx: Tx): Promise<readonly BrandMember[]>;
+
+  /**
+   * The active roles one person holds in this brand, each with the branches it is limited to
+   * (empty: the whole brand), for a caller deciding whether that person would reach a row
+   * (M41: who may be handed an order, D-712).
+   */
+  roleScopes(
+    tx: Tx,
+    orgId: string,
+    userId: string,
+  ): Promise<readonly { readonly role: MembershipRole; readonly branchIds: readonly string[] }[]>;
+
+  /**
+   * Each active member's branches (D-726): the union of the branches their active roles are
+   * limited to, or null when any of their roles reaches the whole brand. For a caller placing
+   * people in branches (the team board), never for deciding what a person may do.
+   */
+  memberBranches(tx: Tx, orgId: string): Promise<ReadonlyMap<string, readonly string[] | null>>;
+}
+
+export const IAM_API = Symbol('IAM_API');
+
+@Injectable()
+export class IamApiService implements IamApi {
+  async ownersAmong(
+    tx: Tx,
+    userIds: readonly string[],
+    viewer: { readonly isOwner?: boolean | undefined },
+  ): Promise<readonly OwnerOnRecord[]> {
+    const rows = await ownersAmong(tx, userIds);
+    return rows.map((row) => ({
+      userId: row.id,
+      name: viewer.isOwner === true ? row.name : null,
+    }));
+  }
+
+  async activeMembers(
+    tx: Tx,
+    orgId: string,
+    options: { readonly roles?: readonly MembershipRole[] } = {},
+  ): Promise<readonly BrandMember[]> {
+    const rows = await activeMembers(tx, orgId, options.roles);
+    return rows.map((row) => ({
+      userId: row.user_id,
+      name: row.name,
+      emailMasked: maskEmail(row.email),
+      roles: row.roles,
+    }));
+  }
+
+  async nameBook(tx: Tx, orgId: string): Promise<ReadonlyMap<string, string>> {
+    const rows = await peopleOfRecord(tx, orgId, null);
+    return new Map(rows.map((row) => [row.id, row.is_owner ? 'Owner' : row.name]));
+  }
+
+  async namesOf(
+    tx: Tx,
+    orgId: string,
+    userIds: readonly string[],
+    viewer: { readonly isOwner?: boolean | undefined },
+  ): Promise<readonly StaffName[]> {
+    const rows = await peopleOfRecord(tx, orgId, [...new Set(userIds)]);
+    return rows.map((row) => ({
+      userId: row.id,
+      name: row.is_owner && viewer.isOwner !== true ? null : row.name,
+      owner: row.is_owner,
+    }));
+  }
+
+  async activeSuperAdmins(tx: Tx): Promise<readonly BrandMember[]> {
+    const rows = await activeSuperAdmins(tx);
+    return rows.map((row) => ({
+      userId: row.id,
+      name: row.is_owner ? 'Owner' : row.name,
+      emailMasked: row.is_owner ? '' : maskEmail(row.email),
+      roles: [],
+    }));
+  }
+
+  async memberBranches(
+    tx: Tx,
+    orgId: string,
+  ): Promise<ReadonlyMap<string, readonly string[] | null>> {
+    const reach = new Map<string, Set<string> | null>();
+    for (const row of await activeRoleBranches(tx, orgId)) {
+      const known = reach.get(row.user_id);
+      if (known === null) continue;
+      if (row.branch_ids.length === 0) {
+        reach.set(row.user_id, null);
+        continue;
+      }
+      const branches = known ?? new Set<string>();
+      for (const id of row.branch_ids) branches.add(id);
+      reach.set(row.user_id, branches);
+    }
+    return new Map(
+      [...reach].map(([userId, branches]) => [
+        userId,
+        branches === null ? null : [...branches].sort(),
+      ]),
+    );
+  }
+
+  async roleScopes(
+    tx: Tx,
+    orgId: string,
+    userId: string,
+  ): Promise<readonly { readonly role: MembershipRole; readonly branchIds: readonly string[] }[]> {
+    const rows = await membershipsOfUser(tx, orgId, userId);
+    return rows
+      .filter((row) => row.is_active)
+      .map((row) => ({ role: row.role, branchIds: row.branch_ids }));
+  }
+}
+
+/**
+ * The interface on its own, without the Better Auth instance `IamModule.register` needs.
+ *
+ * `IamModule` is dynamic because the composition root hands it the auth instance; a module
+ * that only wants to ask who is in a brand should not have to carry that, nor be able to.
+ */
+@Module({
+  providers: [{ provide: IAM_API, useClass: IamApiService }],
+  exports: [IAM_API],
+})
+export class IamDirectoryModule {}

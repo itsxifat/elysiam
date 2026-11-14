@@ -1,0 +1,22 @@
+{
+  "name": "staff activity: team table, 60 people x 31 days",
+  "warmup": 2,
+  "samples": 20,
+  "min": 1143.4014590000006,
+  "p50": 1204.802416999999,
+  "p95": 1297.7043750000012,
+  "p99": 1371.3177919999944,
+  "max": 1371.3177919999944,
+  "mean": 1218.7568584500004,
+  "budgetMs": 1500,
+  "withinBudget": true,
+  "environment": {
+    "commit": "2f6d6bfe",
+    "node": "v24.22.1",
+    "platform": "darwin arm64",
+    "cpu": "Apple M4",
+    "cores": 10,
+    "memoryGb": 16,
+    "at": "2026-11-13T05:44:59.149Z"
+  }
+}

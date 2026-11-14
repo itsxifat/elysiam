@@ -1,0 +1,22 @@
+{
+  "name": "staff activity: a person, 31 days, with the last period and comparison",
+  "warmup": 2,
+  "samples": 10,
+  "min": 1921.1316660000011,
+  "p50": 1991.843249999998,
+  "p95": 2045.5973340000055,
+  "p99": 2045.5973340000055,
+  "max": 2045.5973340000055,
+  "mean": 1994.0248167999991,
+  "budgetMs": null,
+  "withinBudget": null,
+  "environment": {
+    "commit": "2f6d6bfe",
+    "node": "v24.22.1",
+    "platform": "darwin arm64",
+    "cpu": "Apple M4",
+    "cores": 10,
+    "memoryGb": 16,
+    "at": "2026-11-13T05:45:23.155Z"
+  }
+}

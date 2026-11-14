@@ -1,0 +1,32 @@
+/*
+ * The till's print stylesheet (architecture §14: 80 mm receipts via print CSS).
+ *
+ * Paper geometry and nothing else. Colour and type still come from the tokens,
+ * through the receipt's own classes.
+ *
+ * Two rules, and why each is here rather than in a Tailwind class:
+ *
+ * - `@page` cannot be expressed as a utility. No margin, so the receipt's own
+ *   padding is the only gutter. No `size`: a roll printer's driver knows its paper
+ *   is 80 mm wide and as long as the receipt, and a fixed page length here would
+ *   make it feed a blank tail after every sale.
+ * - Everything in `<body>` except the receipt's own region is hidden. A class on
+ *   the app's root would not be enough: dialogs render in portals beside it, and
+ *   the receipt preview is itself a dialog — it would print on top of the receipt.
+ */
+@page {
+  margin: 0;
+}
+
+@media print {
+  html,
+  body {
+    width: 80mm;
+    margin: 0;
+    padding: 0;
+  }
+
+  body > *:not(#print-root) {
+    display: none !important;
+  }
+}

@@ -1,0 +1,115 @@
+{
+  "name": "@elysium/i18n",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./locales/en": {
+      "types": "./dist/locales/en.d.ts",
+      "default": "./dist/locales/en.js"
+    },
+    "./locales/sections/stock-tools.en": {
+      "types": "./dist/locales/sections/stock-tools.en.d.ts",
+      "default": "./dist/locales/sections/stock-tools.en.js"
+    },
+    "./locales/sections/website.en": {
+      "types": "./dist/locales/sections/website.en.d.ts",
+      "default": "./dist/locales/sections/website.en.js"
+    },
+    "./locales/sections/catalog-pricing.en": {
+      "types": "./dist/locales/sections/catalog-pricing.en.d.ts",
+      "default": "./dist/locales/sections/catalog-pricing.en.js"
+    },
+    "./locales/sections/manage.en": {
+      "types": "./dist/locales/sections/manage.en.d.ts",
+      "default": "./dist/locales/sections/manage.en.js"
+    },
+    "./locales/sections/web-marketing.en": {
+      "types": "./dist/locales/sections/web-marketing.en.d.ts",
+      "default": "./dist/locales/sections/web-marketing.en.js"
+    },
+    "./locales/sections/packing.en": {
+      "types": "./dist/locales/sections/packing.en.d.ts",
+      "default": "./dist/locales/sections/packing.en.js"
+    },
+    "./locales/sections/pack-station.en": {
+      "types": "./dist/locales/sections/pack-station.en.d.ts",
+      "default": "./dist/locales/sections/pack-station.en.js"
+    },
+    "./locales/sections/trust.en": {
+      "types": "./dist/locales/sections/trust.en.d.ts",
+      "default": "./dist/locales/sections/trust.en.js"
+    },
+    "./locales/sections/account.en": {
+      "types": "./dist/locales/sections/account.en.d.ts",
+      "default": "./dist/locales/sections/account.en.js"
+    },
+    "./locales/sections/inbox.en": {
+      "types": "./dist/locales/sections/inbox.en.d.ts",
+      "default": "./dist/locales/sections/inbox.en.js"
+    },
+    "./locales/sections/voice.en": {
+      "types": "./dist/locales/sections/voice.en.d.ts",
+      "default": "./dist/locales/sections/voice.en.js"
+    },
+    "./locales/sections/inbox-sell.en": {
+      "types": "./dist/locales/sections/inbox-sell.en.d.ts",
+      "default": "./dist/locales/sections/inbox-sell.en.js"
+    },
+    "./locales/sections/workflow.en": {
+      "types": "./dist/locales/sections/workflow.en.d.ts",
+      "default": "./dist/locales/sections/workflow.en.js"
+    },
+    "./locales/sections/alive.en": {
+      "types": "./dist/locales/sections/alive.en.d.ts",
+      "default": "./dist/locales/sections/alive.en.js"
+    },
+    "./locales/sections/labels.en": {
+      "types": "./dist/locales/sections/labels.en.d.ts",
+      "default": "./dist/locales/sections/labels.en.js"
+    },
+    "./locales/sections/telephony.en": {
+      "types": "./dist/locales/sections/telephony.en.d.ts",
+      "default": "./dist/locales/sections/telephony.en.js"
+    },
+    "./locales/sections/people.en": {
+      "types": "./dist/locales/sections/people.en.d.ts",
+      "default": "./dist/locales/sections/people.en.js"
+    },
+    "./locales/sections/staff.en": {
+      "types": "./dist/locales/sections/staff.en.d.ts",
+      "default": "./dist/locales/sections/staff.en.js"
+    },
+    "./locales/sections/courier.en": {
+      "types": "./dist/locales/sections/courier.en.d.ts",
+      "default": "./dist/locales/sections/courier.en.js"
+    },
+    "./locales/sections/order-edit.en": {
+      "types": "./dist/locales/sections/order-edit.en.d.ts",
+      "default": "./dist/locales/sections/order-edit.en.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -b",
+    "typecheck": "tsc -b",
+    "lint": "eslint .",
+    "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\""
+  },
+  "dependencies": {
+    "@elysium/domain": "workspace:*"
+  },
+  "devDependencies": {
+    "@elysium/config": "workspace:*",
+    "eslint": "catalog:",
+    "fast-check": "catalog:",
+    "typescript": "catalog:"
+  }
+}

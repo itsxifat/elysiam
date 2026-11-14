@@ -1,0 +1,35 @@
+{
+  "imported_at": "2026-11-14T16:47:35.570471+00:00",
+  "server": "103.129.209.29",
+  "domains": {
+    "elysiam.bd": {
+      "source": "/srv/elysium-web/releases/7ede228a682a",
+      "release": "7ede228a682a",
+      "local": "storefront/",
+      "docker_image": "elysium-web:demo"
+    },
+    "erp.elysiam.bd": {
+      "source": "/home/enfinito/erp-brands/src/2c17afcb983d",
+      "release": "2c17afcb983d",
+      "local": "./",
+      "docker_image": "erp-server:2c17afcb983d"
+    }
+  },
+  "file_counts": {
+    "storefront": 168,
+    "erp": 3028,
+    "nginx": 2
+  },
+  "total_imported_files": 3198,
+  "total_imported_bytes": 219197647,
+  "checksum_manifest": "deployment/source-checksums.sha256",
+  "manifest_sha256": "2c352f2013107e1bc642e0c0f38bf6af78fa0944299299bfc3fefd9a6f3666eb",
+  "excluded": [
+    "production environment files and credentials",
+    "database contents and backups",
+    "runtime uploads and caches",
+    "dependencies and generated build output",
+    "older releases and unrelated sites"
+  ],
+  "source_files_modified": false
+}

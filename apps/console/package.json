@@ -1,0 +1,51 @@
+{
+  "name": "@elysium/console",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "vite build",
+    "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
+    "dev": "vite --port 5173 --strictPort",
+    "e2e": "playwright test",
+    "e2e:install": "playwright install --with-deps chromium",
+    "lint": "eslint .",
+    "preview": "vite preview --port 5173 --strictPort",
+    "typecheck": "tsc --noEmit",
+    "e2e:stack": "playwright test -c e2e/stack.config.ts",
+    "e2e:preview": "playwright test -c e2e/preview.config.ts"
+  },
+  "dependencies": {
+    "@elysium/api-client": "workspace:*",
+    "@elysium/config": "workspace:*",
+    "@elysium/contracts": "workspace:*",
+    "@elysium/domain": "workspace:*",
+    "@elysium/i18n": "workspace:*",
+    "@elysium/ui": "workspace:*",
+    "@hookform/resolvers": "catalog:",
+    "@tanstack/react-query": "catalog:",
+    "@tanstack/react-router": "catalog:",
+    "cmdk": "catalog:",
+    "lucide-react": "catalog:",
+    "react": "catalog:",
+    "react-dom": "catalog:",
+    "react-hook-form": "catalog:",
+    "socket.io-client": "catalog:",
+    "uqr": "catalog:",
+    "zod": "catalog:"
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "catalog:",
+    "@playwright/test": "catalog:",
+    "@tailwindcss/vite": "catalog:",
+    "@types/node": "catalog:",
+    "@types/react": "catalog:",
+    "@types/react-dom": "catalog:",
+    "@vitejs/plugin-react": "catalog:",
+    "eslint": "catalog:",
+    "tailwindcss": "catalog:",
+    "typescript": "catalog:",
+    "vite": "catalog:",
+    "vitest": "catalog:"
+  }
+}

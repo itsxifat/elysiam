@@ -1,0 +1,50 @@
+{
+  "name": "@elysium/db",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./testing": {
+      "types": "./dist/testing/index.d.ts",
+      "default": "./dist/testing/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "migrations"
+  ],
+  "scripts": {
+    "build": "tsc -b && node copy-sql-assets.mjs",
+    "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
+    "db:bootstrap": "tsx src/cli/bootstrap.ts",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "tsx src/cli/migrate.ts",
+    "db:seed": "tsx src/cli/seed.ts",
+    "lint": "eslint .",
+    "typecheck": "tsc -b",
+    "db:dev-users": "tsx src/cli/dev-users.ts"
+  },
+  "devDependencies": {
+    "@elysium/config": "workspace:*",
+    "@testcontainers/postgresql": "catalog:",
+    "@types/node": "catalog:",
+    "drizzle-kit": "catalog:",
+    "eslint": "catalog:",
+    "fast-check": "catalog:",
+    "tsx": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  },
+  "dependencies": {
+    "@better-auth/utils": "catalog:",
+    "@elysium/domain": "workspace:*",
+    "better-auth": "catalog:",
+    "drizzle-orm": "catalog:",
+    "postgres": "catalog:",
+    "zod": "catalog:"
+  }
+}

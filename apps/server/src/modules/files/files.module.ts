@@ -1,0 +1,98 @@
+import { Injectable, Module, type OnModuleInit } from '@nestjs/common';
+import { HttpAdapterHost } from '@nestjs/core';
+import { ALLOWED_MIME_TYPES } from '@elysium/integrations';
+import type { FastifyInstance } from 'fastify';
+
+import { serverEnv } from '../../platform/config/env.js';
+import { FILES_API, FilesApiService } from './files.api.js';
+import { FilesController } from './files.controller.js';
+import { PublicMediaController } from './media.controller.js';
+import { FilesService } from './files.service.js';
+import { createStorageDriver, filesEnv } from './files.config.js';
+import { GotenbergClient } from './pdf/gotenberg.client.js';
+import { FileUploadGate } from './upload-gate.js';
+
+/**
+ * Teach Fastify to accept the bytes of an upload.
+ *
+ * Fastify ships parsers for JSON and urlencoded and nothing else, so a
+ * presigned `PUT` carrying `image/png` is answered 415 before any handler runs
+ * — the request never reaches the route that would have checked the token.
+ * Registering a raw parser per allowed type is what makes the local driver's
+ * upload path work at all.
+ *
+ * Deliberately *only* the types on the allow-list: registering `*` would make
+ * this process willing to buffer any body anybody sends, which is a memory
+ * budget set by strangers. `bodyLimit` bounds each one at its own type's ceiling
+ * (M38b: a 90 MiB packing video must not make a CSV parser take 90 MiB), and the
+ * ceiling is checked again in the service against the ticket that was issued.
+ *
+ * An `OnModuleInit` rather than a line in `main.api.ts`, so the HTTP tests —
+ * which build the application from `AppModule` and never touch that file — get
+ * the same parsers production does.
+ */
+@Injectable()
+export class FileUploadBodyParser implements OnModuleInit {
+  constructor(private readonly adapters: HttpAdapterHost) {}
+
+  onModuleInit(): void {
+    const instance = this.adapters.httpAdapter?.getInstance<FastifyInstance>();
+    if (instance === undefined) return;
+
+    for (const rule of ALLOWED_MIME_TYPES) {
+      if (instance.hasContentTypeParser(rule.mime)) continue;
+      instance.addContentTypeParser(
+        rule.mime,
+        { parseAs: 'buffer', bodyLimit: rule.maxBytes },
+        (_request, body, done) => {
+          done(null, body);
+        },
+      );
+    }
+  }
+}
+
+/**
+ * Files and documents (architecture §22).
+ *
+ * The storage driver is chosen once, here, from configuration, and injected.
+ * Nothing downstream can pick a different one: a service that could choose
+ * would eventually choose the local driver in a test and pass while production
+ * ran on R2, which is the class of bug where the test is the problem.
+ *
+ * `GotenbergClient` is exported so later milestones' document templates —
+ * packing slip, courier label, payslip, statements (§22) — reach it through
+ * this module rather than each constructing their own with their own base URL.
+ */
+@Module({
+  controllers: [FilesController, PublicMediaController],
+  providers: [
+    FileUploadBodyParser,
+    // M38b audit (W3): a signed PUT's token is checked before its body is read.
+    FileUploadGate,
+    {
+      provide: FilesService,
+      useFactory: () => {
+        const env = filesEnv();
+        const server = serverEnv();
+        return new FilesService(
+          createStorageDriver({
+            env,
+            apiPublicUrl: server.API_PUBLIC_URL,
+            authSecret: server.AUTH_SECRET,
+          }),
+          env.FILE_URL_TTL_SECONDS,
+          env.FILE_UPLOAD_TTL_SECONDS,
+        );
+      },
+    },
+    {
+      provide: GotenbergClient,
+      useFactory: () => new GotenbergClient(filesEnv().GOTENBERG_URL),
+    },
+    // M35a: whether a file another module was handed may be published.
+    { provide: FILES_API, useClass: FilesApiService },
+  ],
+  exports: [FilesService, GotenbergClient, FILES_API],
+})
+export class FilesModule {}

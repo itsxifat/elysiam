@@ -1,0 +1,314 @@
+/*
+ * The stylesheet every app imports. Tailwind 4 is CSS-first, so this file *is*
+ * the preset: `@theme inline` republishes the semantic tokens as Tailwind
+ * utilities, and `inline` keeps them as `var()` references so switching theme
+ * or org brand at runtime repaints without a rebuild.
+ */
+
+@import 'tailwindcss';
+@import './fonts.css';
+@import './tokens.css';
+
+/*
+ * The kit's own components, scanned by every app that imports this file.
+ *
+ * Tailwind v4 finds class names by scanning the app's folder, and it skips
+ * `node_modules`, which is where `@elysium/ui` is linked. So a class used only inside
+ * a kit component was never generated. The dialog was the one that showed it: its
+ * `top-1/2` and `-translate-y-1/2` existed nowhere in the console, so every dialog
+ * was placed half-way down the page instead of the screen, out of reach on a long
+ * page (found by the money screens' browser run, 2026-10-01). Relative to this file,
+ * so it holds for the console, the till and the portal alike.
+ */
+@source '../';
+
+/* Dark mode is a class on <html>, set from the OS preference and the user's
+   choice. One source of values, no duplicated media query. */
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme inline {
+  --color-canvas: var(--canvas);
+  --color-canvas-foreground: var(--canvas-foreground);
+
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+
+  --color-scan-surface: var(--scan-surface);
+  --color-scan-ink: var(--scan-ink);
+
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+
+  --color-selected: var(--selected);
+  --color-selected-foreground: var(--selected-foreground);
+
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-overlay: var(--overlay);
+
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary-text: var(--primary-text);
+  --color-primary-hover: var(--primary-hover);
+  --color-primary-active: var(--primary-active);
+  --color-primary-subtle: var(--primary-subtle);
+
+  --color-destructive: var(--destructive);
+  --color-destructive-text: var(--destructive-text);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-destructive-subtle: var(--destructive-subtle);
+  --color-destructive-subtle-foreground: var(--destructive-subtle-foreground);
+
+  --color-success: var(--success);
+  --color-success-foreground: var(--success-foreground);
+  --color-success-subtle: var(--success-subtle);
+  --color-success-subtle-foreground: var(--success-subtle-foreground);
+
+  --color-warning: var(--warning);
+  --color-warning-foreground: var(--warning-foreground);
+  --color-warning-subtle: var(--warning-subtle);
+  --color-warning-subtle-foreground: var(--warning-subtle-foreground);
+
+  --color-info: var(--info);
+  --color-info-foreground: var(--info-foreground);
+  --color-info-subtle: var(--info-subtle);
+  --color-info-subtle-foreground: var(--info-subtle-foreground);
+
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-grid: var(--chart-grid);
+  --color-series-1: var(--series-1);
+  --color-series-2: var(--series-2);
+  --color-series-3: var(--series-3);
+  --color-series-4: var(--series-4);
+  --color-series-5: var(--series-5);
+  --color-series-6: var(--series-6);
+  --color-series-7: var(--series-7);
+  --color-series-8: var(--series-8);
+
+  --radius-xs: calc(var(--radius) - 6px);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+
+  --font-sans: var(--font-sans);
+  --font-bangla: var(--font-bangla);
+  --font-mono: var(--font-mono);
+
+  /*
+   * The type scale (D-442). One step per job, so a page cannot invent a size:
+   *   2xs  11px  keyboard hints, a count on a badge
+   *   xs   12px  labels, meta, table headers
+   *   sm   14px  body and table text
+   *   base 15px  section titles, dialog titles
+   *   lg   22px  page titles (every module's <h1> is `text-lg`, so they all moved here)
+   *   xl   24px  the one figure a detail page is about
+   *   2xl  28px  KPI figures
+   * Large sizes carry their own negative tracking: Inter set big reads loose.
+   */
+  --text-2xs: 0.6875rem;
+  --text-2xs--line-height: 1rem;
+  --text-xs: 0.75rem;
+  --text-xs--line-height: 1.125rem;
+  --text-sm: 0.875rem;
+  --text-sm--line-height: 1.375rem;
+  --text-base: 0.9375rem;
+  --text-base--line-height: 1.5rem;
+  --text-lg: 1.375rem;
+  --text-lg--line-height: 1.875rem;
+  --text-lg--letter-spacing: -0.02em;
+  --text-xl: 1.5rem;
+  --text-xl--line-height: 2rem;
+  --text-xl--letter-spacing: -0.022em;
+  --text-2xl: 1.75rem;
+  --text-2xl--line-height: 2.25rem;
+  --text-2xl--letter-spacing: -0.025em;
+
+  --spacing-row: var(--row-height);
+  --spacing-control: var(--control-height);
+  /* The two other control heights the kit needs. Republished here rather than
+     written as arbitrary values at each call site, so `h-control-sm` is the
+     only spelling and a size cannot drift a pixel per component. */
+  --spacing-control-sm: var(--control-height-sm);
+  --spacing-control-lg: var(--control-height-lg);
+  --spacing-sidebar: var(--sidebar-width);
+  --spacing-sidebar-collapsed: var(--sidebar-width-collapsed);
+  --spacing-topbar: var(--topbar-height);
+
+  --container-form: var(--content-width-form);
+  --container-page: var(--content-width-page);
+
+  --shadow-popover: var(--shadow-popover);
+  --shadow-dialog: var(--shadow-dialog);
+
+  --ease-out: var(--ease-out);
+  --animate-in: erp-in var(--duration-base) var(--ease-out);
+  --animate-fade: erp-fade var(--duration-base) var(--ease-out);
+  --animate-sheet-in: erp-sheet-in var(--duration-slow) var(--ease-out);
+  --animate-drawer-in: erp-drawer-in var(--duration-slow) var(--ease-out);
+}
+
+/* Enter motion for floating layers: a short fade and a 4px rise. Nothing exits with
+   a flourish; a closing layer simply goes. Disabled wholesale by the reduced-motion
+   guard below. */
+@keyframes erp-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px) scale(0.99);
+  }
+}
+
+@keyframes erp-fade {
+  from {
+    opacity: 0;
+  }
+}
+
+@keyframes erp-sheet-in {
+  from {
+    opacity: 0;
+    transform: translateX(16px);
+  }
+}
+
+@keyframes erp-drawer-in {
+  from {
+    opacity: 0;
+    transform: translateX(-16px);
+  }
+}
+
+/*
+ * Brand-coloured text on a dark surface (M30's accessibility pass). `text-primary` and
+ * `bg-primary` share one variable, and the dark fill is too dim to read as text, so text alone
+ * takes `--primary-text` in the dark theme. Outside the utilities layer on purpose, so it wins
+ * over the utility it corrects.
+ */
+.dark .text-primary {
+  color: var(--primary-text);
+}
+
+/* Error text on a dark surface, for the same reason (M38a): `text-destructive` shares the
+   destructive fill's variable, which a white label needs dark and text needs light. */
+.dark .text-destructive {
+  color: var(--destructive-text);
+}
+
+/* A scroll area with more past its right edge fades that edge, so a cut-off column reads
+   as "scroll for more". A mask, not a coloured overlay, so it works on any surface. */
+@utility fade-x-end {
+  mask-image: linear-gradient(to left, transparent 0, #000 2.5rem);
+}
+
+/* The same cue for a list that runs on below its lower edge (the sidebar). */
+@utility fade-y-end {
+  mask-image: linear-gradient(to top, transparent 0, #000 2.5rem);
+}
+
+@layer base {
+  *,
+  ::after,
+  ::before {
+    border-color: var(--border);
+  }
+
+  html {
+    color-scheme: light;
+  }
+
+  html.dark {
+    color-scheme: dark;
+  }
+
+  body {
+    background-color: var(--background);
+    color: var(--foreground);
+    font-family: var(--font-sans);
+    font-size: var(--text-sm);
+    line-height: var(--text-sm--line-height);
+    /* Inter at 14px sits a hair loose. Bangla never takes negative tracking (below),
+       because it pulls conjuncts into each other. */
+    letter-spacing: -0.006em;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+  }
+
+  html:lang(bn) body,
+  .font-bangla,
+  [lang='bn'] {
+    letter-spacing: 0;
+  }
+
+  h1,
+  h2,
+  h3 {
+    text-wrap: balance;
+  }
+
+  ::selection {
+    background-color: var(--primary-subtle);
+    color: var(--foreground);
+  }
+
+  /* Every keyboard stop is visible. The order desk is driven by keyboard and an
+     invisible focus ring makes it unusable (architecture §24). */
+  :focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 2px;
+  }
+
+  /* Money, quantities and metrics line up column to column. This single
+     declaration is most of what makes numeric tables look professional. */
+  [data-numeric],
+  th[data-numeric],
+  td[data-numeric] {
+    font-variant-numeric: tabular-nums;
+    text-align: right;
+  }
+
+  /* The native date controls the kit still uses (a business date is a native
+     `type="date"`, D-033) keep their digits in columns and a quieter picker icon. */
+  input[type='date'],
+  input[type='month'],
+  input[type='time'] {
+    font-variant-numeric: tabular-nums;
+  }
+
+  input[type='date']::-webkit-calendar-picker-indicator,
+  input[type='month']::-webkit-calendar-picker-indicator {
+    opacity: 0.55;
+    cursor: pointer;
+  }
+
+  /* Scrollbars as quiet as the rest of the chrome. */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--input) transparent;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    ::after,
+    ::before {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+}

@@ -1,0 +1,1066 @@
+import { sql } from 'drizzle-orm';
+import {
+  bigint,
+  boolean,
+  check,
+  customType,
+  foreignKey,
+  index,
+  integer,
+  pgSchema,
+  primaryKey,
+  text,
+  timestamp,
+  unique,
+  uniqueIndex,
+  uuid,
+} from 'drizzle-orm/pg-core';
+
+import { skus } from '../catalog/index.js';
+import { primaryId, timestamps } from '../columns.js';
+import { fileObjects } from '../files/index.js';
+import { users } from '../iam/index.js';
+import { orders } from '../orders/index.js';
+import { locations, organizations } from '../org/index.js';
+
+/**
+ * Packing (M35b, D-554): the scanner phones staff pack parcels with; M38b's packing station,
+ * its scans, the packing videos and the brand's packing settings (D-610 to D-615); M38c's IP
+ * cameras over the packing tables (D-668 to D-676).
+ *
+ * Tenant tables with the full treatment (invariant 4).
+ */
+export const packing = pgSchema('packing');
+
+/**
+ * A scanner device's sign-in (D-554): the old site's 30-day bearer token, kept as a SHA-256
+ * and revocable, for one staff member in one brand. The token itself carries the brand's id
+ * (`sdt_<org id>_…`) so it is looked up inside that brand only. The person's roles are read
+ * again on every request, so a deactivated account or a role taken away stops the phone at
+ * once; revoking ends the device whatever its expiry says.
+ */
+export const scannerDevices = packing.table(
+  'scanner_devices',
+  {
+    id: primaryId,
+    orgId: uuid('org_id')
+      .notNull()
+      .references(() => organizations.id, { onDelete: 'restrict' }),
+    userId: text('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    label: text('label').notNull(),
+    tokenSha256: text('token_sha256').notNull(),
+    /** `password` (signed in on the phone) or `console` (paired from a signed-in console). */
+    via: text('via').notNull(),
+    lastUsedAt: timestamp('last_used_at', { withTimezone: true, mode: 'date' }),
+    expiresAt: timestamp('expires_at', { withTimezone: true, mode: 'date' }).notNull(),
+    revokedAt: timestamp('revoked_at', { withTimezone: true, mode: 'date' }),
+    revokedBy: text('revoked_by'),
+    ...timestamps,
+  },
+  (table) => [
+    unique('scanner_devices_org_id_id_key').on(table.orgId, table.id),
+    index('scanner_devices_org_idx').on(table.orgId),
+    index('scanner_devices_org_user_idx').on(table.orgId, table.userId, table.createdAt),
+    uniqueIndex('scanner_devices_token_idx').on(table.tokenSha256),
+    check('scanner_devices_label_length', sql`length(${table.label}) between 1 and 80`),
+    check('scanner_devices_token_shape', sql`${table.tokenSha256} ~ '^[0-9a-f]{64}$'`),
+    check('scanner_devices_via', sql`${table.via} in ('password', 'console')`),
+    check(
+      'scanner_devices_revocation_complete',
+      sql`(${table.revokedAt} is null) = (${table.revokedBy} is null)`,
+    ),
+    check('scanner_devices_expiry', sql`${table.expiresAt} > ${table.createdAt}`),
+  ],
+);
+
+/**
+ * A brand's packing settings (M38b, D-615): one row, written the first time an org admin
+ * saves. No row reads as the defaults (video on).
+ */
+export const packingSettings = packing.table(
+  'settings',
+  {
+    orgId: uuid('org_id')
+      .primaryKey()
+      .references(() => organizations.id, { onDelete: 'restrict' }),
+    /** Whether the station records the packing on camera (D-611). */
+    videoEnabled: boolean('video_enabled').notNull().default(true),
+    /**
+     * M51 (D-931): how long with no scan before a lot's video pauses; the next scan resumes it.
+     * Ten seconds by default (the owner's number).
+     */
+    idlePauseMs: integer('idle_pause_ms').notNull().default(10_000),
+    /**
+     * M52 (D-941, D-949): an order of more than this many pieces is asked how many lots it goes in
+     * when a person confirms it. Five until the brand chooses; null asks nobody.
+     */
+    lotAskAbovePieces: integer('lot_ask_above_pieces').default(5),
+    updatedBy: text('updated_by')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    ...timestamps,
+  },
+  (table) => [
+    index('packing_settings_org_idx').on(table.orgId),
+    check('packing_settings_idle_pause', sql`${table.idlePauseMs} between 3000 and 60000`),
+    check(
+      'packing_settings_lot_ask',
+      sql`${table.lotAskAbovePieces} is null or ${table.lotAskAbovePieces} between 1 and 500`,
+    ),
+  ],
+);
+
+/**
+ * A terminal (M46, D-801): a packing desk (scan, pack, film with its cameras) or a label desk
+ * (print), at the hub's stock location (null: it serves every location). Never deleted: the
+ * print log and the packing record name it; switched off instead.
+ */
+export const packingTerminals = packing.table(
+  'terminals',
+  {
+    id: primaryId,
+    orgId: uuid('org_id')
+      .notNull()
+      .references(() => organizations.id, { onDelete: 'restrict' }),
+    kind: text('kind').notNull(),
+    name: text('name').notNull(),
+    locationId: uuid('location_id'),
+    active: boolean('active').notNull().default(true),
+    createdBy: text('created_by')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    updatedBy: text('updated_by')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    ...timestamps,
+  },
+  (table) => [
+    unique('packing_terminals_org_id_id_key').on(table.orgId, table.id),
+    uniqueIndex('packing_terminals_org_name_idx').on(table.orgId, table.name),
+    index('packing_terminals_org_idx').on(table.orgId),
+    foreignKey({
+      name: 'packing_terminals_org_id_location_id_fk',
+      columns: [table.orgId, table.locationId],
+      foreignColumns: [locations.orgId, locations.id],
+    }).onDelete('restrict'),
+    check('packing_terminals_kind', sql`${table.kind} in ('packing', 'label')`),
+    check('packing_terminals_name_length', sql`length(${table.name}) between 1 and 40`),
+  ],
+);
+
+/** Who works at a terminal (D-802): assigned by a supervisor, removed when they move. */
+export const packingTerminalMembers = packing.table(
+  'terminal_members',
+  {
+    orgId: uuid('org_id')
+      .notNull()
+      .references(() => organizations.id, { onDelete: 'restrict' }),
+    terminalId: uuid('terminal_id').notNull(),
+    userId: text('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    assignedBy: text('assigned_by')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    assignedAt: timestamp('assigned_at', { withTimezone: true, mode: 'date' })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    primaryKey({
+      name: 'packing_terminal_members_pkey',
+      columns: [table.orgId, table.terminalId, table.userId],
+    }),
+    index('packing_terminal_members_org_idx').on(table.orgId),
+    index('packing_terminal_members_user_idx').on(table.orgId, table.userId),
+    foreignKey({
+      name: 'packing_terminal_members_org_id_terminal_id_fk',
+      columns: [table.orgId, table.terminalId],
+      foreignColumns: [packingTerminals.orgId, packingTerminals.id],
+    }).onDelete('cascade'),
+  ],
+);
+
+/**
+ * A computer bound to a terminal (D-803): "this computer is Packing 2", set by a supervisor.
+ * The browser keeps the token (`tdt_<org id>_…`, shown once, kept here as its SHA-256) and sends
+ * it with the terminal's work; its check-in every half minute says who is signed in there.
+ */
+export const packingTerminalDevices = packing.table(
+  'terminal_devices',
+  {
+    id: primaryId,
+    orgId: uuid('org_id')
+      .notNull()
+      .references(() => organizations.id, { onDelete: 'restrict' }),
+    terminalId: uuid('terminal_id').notNull(),
+    label: text('label').notNull(),
+    tokenSha256: text('token_sha256').notNull(),
+    boundBy: text('bound_by')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    lastSeenAt: timestamp('last_seen_at', { withTimezone: true, mode: 'date' }),
+    /** Who was signed in at the last check-in, and since when they have been there. */
+    lastUserId: text('last_user_id').references(() => users.id, { onDelete: 'restrict' }),
+    userSince: timestamp('user_since', { withTimezone: true, mode: 'date' }),
+    revokedAt: timestamp('revoked_at', { withTimezone: true, mode: 'date' }),
+    revokedBy: text('revoked_by').references(() => users.id, { onDelete: 'restrict' }),
+    ...timestamps,
+  },
+  (table) => [
+    unique('packing_terminal_devices_org_id_id_key').on(table.orgId, table.id),
+    uniqueIndex('packing_terminal_devices_token_idx').on(table.tokenSha256),
+    index('packing_terminal_devices_org_idx').on(table.orgId),
+    index('packing_terminal_devices_terminal_idx').on(table.orgId, table.terminalId),
+    foreignKey({
+      name: 'packing_terminal_devices_org_id_terminal_id_fk',
+      columns: [table.orgId, table.terminalId],
+      foreignColumns: [packingTerminals.orgId, packingTerminals.id],
+    }).onDelete('restrict'),
+    check('packing_terminal_devices_label_length', sql`length(${table.label}) between 1 and 60`),
+    check('packing_terminal_devices_token_shape', sql`${table.tokenSha256} ~ '^[0-9a-f]{64}$'`),
+    check(
+      'packing_terminal_devices_revocation_complete',
+      sql`(${table.revokedAt} is null) = (${table.revokedBy} is null)`,
+    ),
+  ],
+);
+
+/** AES-256-GCM ciphertext under `STOREFRONT_CREDENTIALS_KEY` (D-528's box), bound to its row. */
+const sealedBytes = customType<{ data: Buffer; driverData: Buffer }>({
+  dataType: () => 'bytea',
+  fromDriver: (value) => Buffer.from(value as unknown as Uint8Array),
+  toDriver: (value) => value,
+});
+
+/**
+ * An IP camera over a packing table (M38c, D-668, D-669): the camera process records its RTSP
+ * stream into a rolling buffer on the brand server and cuts each packing's video from it.
+ *
+ * The address carries no credentials (a check holds it): the user name is its own column and
+ * the password is sealed with the brand's credentials key, bound to this row, write-only and
+ * shown as a fingerprint. Never deleted (a session and a video name the camera that filmed
+ * them); switched off instead. The recorder's last word is kept on the row (`last_segment_at`,
+ * `last_error_code`, `status_at`), written by the camera process only, never by the settings.
+ */
+export const packingCameras = packing.table(
+  'cameras',
+  {
+    id: primaryId,
+    orgId: uuid('org_id')
+      .notNull()
+      .references(() => organizations.id, { onDelete: 'restrict' }),
+    name: text('name').notNull(),
+    /** `rtsp://host[:port]/path`, never with a user name or password in it. */
+    rtspUrl: text('rtsp_url').notNull(),
+    username: text('username').notNull().default(''),
+    passwordSealed: sealedBytes('password_sealed'),
+    passwordFingerprint: text('password_fingerprint'),
+    /** The installation key the password was sealed under. */
+    keyId: text('key_id'),
+    enabled: boolean('enabled').notNull().default(true),
+    /** When the recorder last stored a piece of this camera's stream. */
+    lastSegmentAt: timestamp('last_segment_at', { withTimezone: true, mode: 'date' }),
+    /** Why the stream last stopped (`auth_failed`, `unreachable`, …), cleared once it flows. */
+    lastErrorCode: text('last_error_code'),
+    lastErrorAt: timestamp('last_error_at', { withTimezone: true, mode: 'date' }),
+    /** When the recorder last reported on this camera at all. */
+    statusAt: timestamp('status_at', { withTimezone: true, mode: 'date' }),
+    /**
+     * Until when someone is looking at the camera's live preview (D-683): written by the API
+     * at most every five seconds while a station shows it; the camera process runs the preview
+     * while it is in the future.
+     */
+    previewWantedUntil: timestamp('preview_wanted_until', { withTimezone: true, mode: 'date' }),
+    /**
+     * A camera deleted from use (D-684): switched off for good, its password wiped, gone from
+     * every list; the row stays because past sessions and videos name it.
+     */
+    deletedAt: timestamp('deleted_at', { withTimezone: true, mode: 'date' }),
+    deletedBy: text('deleted_by').references(() => users.id, { onDelete: 'restrict' }),
+    /** M46 (D-804): the packing terminal it films, or none. */
+    terminalId: uuid('terminal_id'),
+    createdBy: text('created_by')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    updatedBy: text('updated_by')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    ...timestamps,
+  },
+  (table) => [
+    unique('packing_cameras_org_id_id_key').on(table.orgId, table.id),
+    foreignKey({
+      name: 'packing_cameras_org_id_terminal_id_fk',
+      columns: [table.orgId, table.terminalId],
+      foreignColumns: [packingTerminals.orgId, packingTerminals.id],
+    }).onDelete('restrict'),
+    // One name per camera in use: a deleted camera's name is free again (D-684).
+    uniqueIndex('packing_cameras_org_name_live_idx')
+      .on(table.orgId, table.name)
+      .where(sql`deleted_at is null`),
+    index('packing_cameras_org_idx').on(table.orgId),
+    check('packing_cameras_name_length', sql`length(${table.name}) between 1 and 60`),
+    check(
+      'packing_cameras_rtsp_url',
+      sql`${table.rtspUrl} ~* '^rtsp://[^/@[:space:]]+(/[^[:space:]]*)?$' and length(${table.rtspUrl}) <= 500`,
+    ),
+    check(
+      'packing_cameras_username',
+      sql`length(${table.username}) <= 64 and position(':' in ${table.username}) = 0`,
+    ),
+    check(
+      'packing_cameras_password_complete',
+      sql`(${table.passwordSealed} is null) = (${table.passwordFingerprint} is null)
+          and (${table.passwordSealed} is null or ${table.keyId} is not null)`,
+    ),
+    check(
+      'packing_cameras_deleted',
+      sql`(${table.deletedAt} is null) = (${table.deletedBy} is null)
+          and (${table.deletedAt} is null or (not ${table.enabled} and ${table.passwordSealed} is null))`,
+    ),
+    check(
+      'packing_cameras_error_code',
+      sql`${table.lastErrorCode} is null or ${table.lastErrorCode} ~ '^[a-z_]{1,40}$'`,
+    ),
+  ],
+);
+
+/**
+ * One order at the packing station (M38b, D-610): opened by the first person to bring the
+ * order up, resumed by anyone after a reload, completed once, in the transaction that moves
+ * the order to `packed` through the state machine. One per order: a packed order never
+ * returns to `confirmed`, so it is never packed twice.
+ *
+ * `order_no` is the order's number as it was opened (numbers never change), so the recent
+ * list needs no read across the module boundary for it.
+ */
+export const packingSessions = packing.table(
+  'sessions',
+  {
+    id: primaryId,
+    orgId: uuid('org_id')
+      .notNull()
+      .references(() => organizations.id, { onDelete: 'restrict' }),
+    orderId: uuid('order_id').notNull(),
+    orderNo: text('order_no').notNull(),
+    /** `open` → `completed`, once (a trigger holds it). */
+    status: text('status').notNull().default('open'),
+    /** The brand's video setting when the session opened: whether a video is expected. */
+    videoRequired: boolean('video_required').notNull(),
+    startedBy: text('started_by')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    startedAt: timestamp('started_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+    completedBy: text('completed_by').references(() => users.id, { onDelete: 'restrict' }),
+    completedAt: timestamp('completed_at', { withTimezone: true, mode: 'date' }),
+    /**
+     * The IP camera filming this packing (M38c, D-670), or null for the desk's own camera
+     * recorded by the browser. Chosen when the order is opened; fixed once recording starts.
+     */
+    cameraId: uuid('camera_id'),
+    /**
+     * The camera recording's window (D-671): from two seconds before the first scan the
+     * station accepted, to the finish (at most fifteen minutes), each set once. `recording_by`
+     * is who made that first accepted scan: the packer the video is filed under.
+     */
+    recordingFrom: timestamp('recording_from', { withTimezone: true, mode: 'date' }),
+    recordingTo: timestamp('recording_to', { withTimezone: true, mode: 'date' }),
+    recordingBy: text('recording_by').references(() => users.id, { onDelete: 'restrict' }),
+    /** M46 (D-802): the packing terminal it was opened at, or null (no bound computer). */
+    terminalId: uuid('terminal_id'),
+    /**
+     * M51 (D-934): `pack` (the packing station, a confirmed order to `packed`) or `return` (the
+     * return station, a parcel on its way back inspected and received: completed with the
+     * order `returned`). One of each per order.
+     */
+    kind: text('kind').notNull().default('pack'),
+    ...timestamps,
+  },
+  (table) => [
+    unique('packing_sessions_org_id_id_key').on(table.orgId, table.id),
+    foreignKey({
+      name: 'packing_sessions_org_id_terminal_id_fk',
+      columns: [table.orgId, table.terminalId],
+      foreignColumns: [packingTerminals.orgId, packingTerminals.id],
+    }).onDelete('restrict'),
+    index('packing_sessions_terminal_idx').on(table.orgId, table.terminalId, table.completedAt),
+    unique('packing_sessions_org_order_kind_key').on(table.orgId, table.orderId, table.kind),
+    check('packing_sessions_kind', sql`${table.kind} in ('pack', 'return')`),
+    index('packing_sessions_kind_started_idx').on(table.orgId, table.kind, table.startedAt),
+    index('packing_sessions_org_idx').on(table.orgId),
+    index('packing_sessions_org_started_idx').on(table.orgId, table.startedAt),
+    // M57: a period's completed packings.
+    index('packing_sessions_org_completed_idx').on(table.orgId, table.completedAt),
+    foreignKey({
+      name: 'packing_sessions_org_id_order_id_fk',
+      columns: [table.orgId, table.orderId],
+      foreignColumns: [orders.orgId, orders.id],
+    }).onDelete('restrict'),
+    check('packing_sessions_status', sql`${table.status} in ('open', 'completed')`),
+    check(
+      'packing_sessions_completion',
+      sql`(${table.status} = 'completed') = (${table.completedAt} is not null and ${table.completedBy} is not null)`,
+    ),
+    check('packing_sessions_order_no_shape', sql`length(${table.orderNo}) between 1 and 64`),
+    index('packing_sessions_camera_window_idx').on(
+      table.orgId,
+      table.cameraId,
+      table.recordingFrom,
+    ),
+    foreignKey({
+      name: 'packing_sessions_org_id_camera_id_fk',
+      columns: [table.orgId, table.cameraId],
+      foreignColumns: [packingCameras.orgId, packingCameras.id],
+    }).onDelete('restrict'),
+    check(
+      'packing_sessions_recording_camera',
+      sql`${table.recordingFrom} is null or ${table.cameraId} is not null`,
+    ),
+    check(
+      'packing_sessions_recording_by',
+      sql`(${table.recordingFrom} is null) = (${table.recordingBy} is null)`,
+    ),
+    check(
+      'packing_sessions_recording_window',
+      sql`${table.recordingTo} is null
+          or (${table.recordingFrom} is not null
+              and ${table.recordingTo} >= ${table.recordingFrom}
+              and ${table.recordingTo} <= ${table.recordingFrom} + interval '15 minutes')`,
+    ),
+  ],
+);
+
+/**
+ * Every scan at the station (M38b, D-610), refused ones included: the record of what went
+ * into the parcel and what was caught at the table. Append-only (INSERT and SELECT only).
+ *
+ * `scan_id` is the browser's key for one press of the scanner: a scan retried after a
+ * dropped connection is the same row, so a piece is never counted twice. `removed` is a piece
+ * taken back out ("Take one out"), counted against the SKU's packed pieces.
+ */
+export const packingScans = packing.table(
+  'scans',
+  {
+    id: primaryId,
+    orgId: uuid('org_id')
+      .notNull()
+      .references(() => organizations.id, { onDelete: 'restrict' }),
+    sessionId: uuid('session_id').notNull(),
+    scanId: uuid('scan_id').notNull(),
+    /** What the scanner typed, or `''` for a removal chosen from the list. */
+    code: text('code').notNull(),
+    /** The SKU the code named, or null for a code that names none. */
+    skuId: uuid('sku_id'),
+    outcome: text('outcome').notNull(),
+    scannedBy: text('scanned_by')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    scannedAt: timestamp('scanned_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+    /** M46 (D-807): the lot (bag) the piece went into; 1 for an order packed in one. */
+    lotNo: integer('lot_no').notNull().default(1),
+  },
+  (table) => [
+    unique('packing_scans_org_id_id_key').on(table.orgId, table.id),
+    check('packing_scans_lot_no', sql`${table.lotNo} between 1 and 20`),
+    unique('packing_scans_session_scan_key').on(table.orgId, table.sessionId, table.scanId),
+    index('packing_scans_org_idx').on(table.orgId),
+    index('packing_scans_session_idx').on(table.orgId, table.sessionId, table.scannedAt),
+    // M57: a period's scans across the hub.
+    index('packing_scans_org_scanned_idx').on(table.orgId, table.scannedAt),
+    foreignKey({
+      name: 'packing_scans_org_id_session_id_fk',
+      columns: [table.orgId, table.sessionId],
+      foreignColumns: [packingSessions.orgId, packingSessions.id],
+    }).onDelete('restrict'),
+    foreignKey({
+      name: 'packing_scans_org_id_sku_id_fk',
+      columns: [table.orgId, table.skuId],
+      foreignColumns: [skus.orgId, skus.id],
+    }).onDelete('restrict'),
+    // M51 (D-930): `label` is the parcel's label scanned at the table, starting or stopping a
+    // lot's recording (or refused); it names no SKU.
+    check(
+      'packing_scans_outcome',
+      sql`${table.outcome} in ('accepted', 'removed', 'unknown_code', 'wrong_item', 'wrong_variant', 'over', 'label')`,
+    ),
+    check(
+      'packing_scans_sku_named',
+      sql`(${table.skuId} is null) = (${table.outcome} in ('unknown_code', 'label'))`,
+    ),
+    check('packing_scans_code_length', sql`length(${table.code}) <= 120`),
+  ],
+);
+
+/**
+ * One lot's recording (M51, D-930 to D-933): from the parcel label's scan that started it to the
+ * scan that stopped it (or Close lot, Finish, the return's receipt, fifteen minutes). Its video
+ * pauses after `idle_ms` with no scan and resumes at the next; the stretches are read from the
+ * session's scans of the lot. `camera_id` is the IP camera filming it (with the session's other
+ * cameras, D-804), or null for the desk's own camera recorded by the browser. Set once each.
+ */
+export const packingRecordings = packing.table(
+  'recordings',
+  {
+    id: primaryId,
+    orgId: uuid('org_id')
+      .notNull()
+      .references(() => organizations.id, { onDelete: 'restrict' }),
+    sessionId: uuid('session_id').notNull(),
+    lotNo: integer('lot_no').notNull(),
+    /**
+     * 1, or the next when a return's bag is reopened before its receipt (D-934): a bag stopped by
+     * mistake still has pieces to scan, and a parcel has one receipt. Each take is its own video.
+     * A packing's lot has one: a closed bag stays closed (D-807).
+     */
+    take: integer('take').notNull().default(1),
+    /** Whether a video is expected: the brand records (D-615) and, for a camera, it is on. */
+    videoRequired: boolean('video_required').notNull(),
+    cameraId: uuid('camera_id'),
+    /** The pause rule in force when it started (D-931). */
+    idleMs: integer('idle_ms').notNull(),
+    startedAt: timestamp('started_at', { withTimezone: true, mode: 'date' }).notNull(),
+    startedBy: text('started_by')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    stoppedAt: timestamp('stopped_at', { withTimezone: true, mode: 'date' }),
+    stoppedBy: text('stopped_by').references(() => users.id, { onDelete: 'restrict' }),
+    /** `label` (scanned again), `closed`, `finished`, `received` or `timed_out`. */
+    stopReason: text('stop_reason'),
+    ...timestamps,
+  },
+  (table) => [
+    unique('packing_recordings_org_id_id_key').on(table.orgId, table.id),
+    unique('packing_recordings_session_lot_take_key').on(
+      table.orgId,
+      table.sessionId,
+      table.lotNo,
+      table.take,
+    ),
+    check('packing_recordings_take', sql`${table.take} between 1 and 99`),
+    index('packing_recordings_org_idx').on(table.orgId),
+    index('packing_recordings_camera_idx').on(table.orgId, table.cameraId, table.startedAt),
+    index('packing_recordings_open_idx')
+      .on(table.orgId, table.startedAt)
+      .where(sql`${table.stoppedAt} is null`),
+    foreignKey({
+      name: 'packing_recordings_org_id_session_id_fk',
+      columns: [table.orgId, table.sessionId],
+      foreignColumns: [packingSessions.orgId, packingSessions.id],
+    }).onDelete('restrict'),
+    foreignKey({
+      name: 'packing_recordings_org_id_camera_id_fk',
+      columns: [table.orgId, table.cameraId],
+      foreignColumns: [packingCameras.orgId, packingCameras.id],
+    }).onDelete('restrict'),
+    check('packing_recordings_lot_no', sql`${table.lotNo} between 1 and 20`),
+    check('packing_recordings_idle', sql`${table.idleMs} between 3000 and 60000`),
+    check(
+      'packing_recordings_stop',
+      sql`(${table.stoppedAt} is null and ${table.stoppedBy} is null and ${table.stopReason} is null)
+       or (${table.stoppedAt} is not null and ${table.stopReason} is not null
+           and ${table.stoppedAt} >= ${table.startedAt}
+           and ${table.stoppedAt} <= ${table.startedAt} + interval '15 minutes')`,
+    ),
+    check(
+      'packing_recordings_stop_reason',
+      sql`${table.stopReason} is null or ${table.stopReason} in ('label', 'closed', 'finished', 'received', 'timed_out')`,
+    ),
+    check(
+      'packing_recordings_stopped_by',
+      sql`${table.stopReason} is null or (${table.stopReason} = 'timed_out') = (${table.stoppedBy} is null)`,
+    ),
+  ],
+);
+
+/**
+ * One recorded part of a session's packing video (M38b, D-611, D-612). Registered by the
+ * browser when the camera starts (its own id, so a retry is the same row), the file attached
+ * once the upload is finalized, and kept as a record after the retention job deletes the file
+ * (`deleted_at`, `deleted_reason`, `deleted_file_id`). A reload mid-recording uploads what was
+ * recorded as one part and starts the next.
+ */
+export const packingVideos = packing.table(
+  'videos',
+  {
+    id: uuid('id').primaryKey(),
+    orgId: uuid('org_id')
+      .notNull()
+      .references(() => organizations.id, { onDelete: 'restrict' }),
+    sessionId: uuid('session_id').notNull(),
+    /** 1, 2, … in the order the parts were started. */
+    part: integer('part').notNull(),
+    recordedBy: text('recorded_by')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    startedAt: timestamp('started_at', { withTimezone: true, mode: 'date' }).notNull(),
+    /** What the browser recorded: `video/webm` or `video/mp4`. */
+    mime: text('mime').notNull(),
+    fileId: uuid('file_id'),
+    durationMs: integer('duration_ms'),
+    sizeBytes: bigint('size_bytes', { mode: 'bigint' }),
+    uploadedAt: timestamp('uploaded_at', { withTimezone: true, mode: 'date' }),
+    deletedAt: timestamp('deleted_at', { withTimezone: true, mode: 'date' }),
+    /** The order's state that started the seven days (`packingVideoExpiry`). */
+    deletedReason: text('deleted_reason'),
+    deletedFileId: uuid('deleted_file_id'),
+    /**
+     * Who filmed it (M38c, D-674): `browser` (the desk's camera, uploaded by the station) or
+     * `camera` (an IP camera, cut on the server from its buffer), with that camera.
+     */
+    source: text('source').notNull().default('browser'),
+    cameraId: uuid('camera_id'),
+    /**
+     * M51 (D-932): the lot's recording this part belongs to (null: filmed before M51, the
+     * whole session's), and its lot, so each lot's video is kept apart under the one order.
+     */
+    recordingId: uuid('recording_id'),
+    lotNo: integer('lot_no').notNull().default(1),
+    ...timestamps,
+  },
+  (table) => [
+    unique('packing_videos_org_id_id_key').on(table.orgId, table.id),
+    foreignKey({
+      name: 'packing_videos_org_id_recording_id_fk',
+      columns: [table.orgId, table.recordingId],
+      foreignColumns: [packingRecordings.orgId, packingRecordings.id],
+    }).onDelete('restrict'),
+    index('packing_videos_recording_idx').on(table.orgId, table.recordingId),
+    check('packing_videos_lot_no', sql`${table.lotNo} between 1 and 20`),
+    unique('packing_videos_session_part_key').on(table.orgId, table.sessionId, table.part),
+    uniqueIndex('packing_videos_file_idx').on(table.orgId, table.fileId),
+    index('packing_videos_org_idx').on(table.orgId),
+    index('packing_videos_session_idx').on(table.orgId, table.sessionId),
+    foreignKey({
+      name: 'packing_videos_org_id_session_id_fk',
+      columns: [table.orgId, table.sessionId],
+      foreignColumns: [packingSessions.orgId, packingSessions.id],
+    }).onDelete('restrict'),
+    foreignKey({
+      name: 'packing_videos_org_id_file_id_fk',
+      columns: [table.orgId, table.fileId],
+      foreignColumns: [fileObjects.orgId, fileObjects.id],
+    }).onDelete('restrict'),
+    foreignKey({
+      name: 'packing_videos_org_id_camera_id_fk',
+      columns: [table.orgId, table.cameraId],
+      foreignColumns: [packingCameras.orgId, packingCameras.id],
+    }).onDelete('restrict'),
+    check('packing_videos_source', sql`${table.source} in ('browser', 'camera')`),
+    check(
+      'packing_videos_source_camera',
+      sql`(${table.source} = 'camera') = (${table.cameraId} is not null)`,
+    ),
+    check('packing_videos_part', sql`${table.part} between 1 and 99`),
+    check('packing_videos_mime', sql`${table.mime} in ('video/webm', 'video/mp4')`),
+    check(
+      'packing_videos_upload_complete',
+      sql`(${table.fileId} is null or (${table.uploadedAt} is not null and ${table.durationMs} is not null and ${table.sizeBytes} is not null))`,
+    ),
+    check(
+      'packing_videos_duration',
+      sql`${table.durationMs} is null or ${table.durationMs} between 0 and 3600000`,
+    ),
+    check(
+      'packing_videos_deletion_complete',
+      sql`(${table.deletedAt} is null and ${table.deletedReason} is null and ${table.deletedFileId} is null)
+       or (${table.deletedAt} is not null and ${table.fileId} is null and ${table.deletedFileId} is not null
+           and ${table.deletedReason} in ('delivered', 'partially_delivered', 'returned', 'cancelled', 'exchange'))`,
+    ),
+  ],
+);
+
+// --- M46: printers, the print queue and its log, lots and the handover (D-804 to D-819) ------
+
+/**
+ * A packing session's other cameras (D-804): a packing terminal with several cameras films the
+ * order with all of them. The session's own `camera_id` is the first; these are the rest, each
+ * cut from the same recording window.
+ */
+export const packingSessionCameras = packing.table(
+  'session_cameras',
+  {
+    orgId: uuid('org_id')
+      .notNull()
+      .references(() => organizations.id, { onDelete: 'restrict' }),
+    sessionId: uuid('session_id').notNull(),
+    cameraId: uuid('camera_id').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+  },
+  (table) => [
+    primaryKey({
+      name: 'packing_session_cameras_pkey',
+      columns: [table.orgId, table.sessionId, table.cameraId],
+    }),
+    index('packing_session_cameras_org_idx').on(table.orgId),
+    index('packing_session_cameras_camera_idx').on(table.orgId, table.cameraId),
+    foreignKey({
+      name: 'packing_session_cameras_org_id_session_id_fk',
+      columns: [table.orgId, table.sessionId],
+      foreignColumns: [packingSessions.orgId, packingSessions.id],
+    }).onDelete('restrict'),
+    foreignKey({
+      name: 'packing_session_cameras_org_id_camera_id_fk',
+      columns: [table.orgId, table.cameraId],
+      foreignColumns: [packingCameras.orgId, packingCameras.id],
+    }).onDelete('restrict'),
+  ],
+);
+
+/**
+ * A printer (D-810): on a terminal, reached from the brand server over IPP, IPPS or raw TCP
+ * 9100 on the hub's LAN, or a browser print station at the label desk. Its paper in micrometres
+ * (4 in is 101 600). The IPP password is sealed like a camera's (D-814). Never deleted: the
+ * print log names it; deleted from use instead.
+ */
+export const printers = packing.table(
+  'printers',
+  {
+    id: primaryId,
+    orgId: uuid('org_id')
+      .notNull()
+      .references(() => organizations.id, { onDelete: 'restrict' }),
+    terminalId: uuid('terminal_id').notNull(),
+    name: text('name').notNull(),
+    connection: text('connection').notNull(),
+    language: text('language').notNull(),
+    host: text('host'),
+    port: integer('port'),
+    ippPath: text('ipp_path').notNull().default('/ipp/print'),
+    dpi: integer('dpi').notNull().default(203),
+    medium: text('medium').notNull(),
+    widthUm: integer('width_um').notNull(),
+    heightUm: integer('height_um').notNull(),
+    documents: text('documents')
+      .array()
+      .notNull()
+      .default(sql`'{}'::text[]`),
+    copies: integer('copies').notNull().default(1),
+    username: text('username').notNull().default(''),
+    passwordSealed: sealedBytes('password_sealed'),
+    passwordFingerprint: text('password_fingerprint'),
+    keyId: text('key_id'),
+    enabled: boolean('enabled').notNull().default(true),
+    /** The worker's last probe (D-815): online, offline or error, and why. */
+    status: text('status').notNull().default('unknown'),
+    statusDetail: text('status_detail'),
+    statusAt: timestamp('status_at', { withTimezone: true, mode: 'date' }),
+    deletedAt: timestamp('deleted_at', { withTimezone: true, mode: 'date' }),
+    deletedBy: text('deleted_by').references(() => users.id, { onDelete: 'restrict' }),
+    createdBy: text('created_by')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    updatedBy: text('updated_by')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    ...timestamps,
+  },
+  (table) => [
+    unique('printers_org_id_id_key').on(table.orgId, table.id),
+    uniqueIndex('printers_org_name_live_idx')
+      .on(table.orgId, table.name)
+      .where(sql`deleted_at is null`),
+    index('printers_org_idx').on(table.orgId),
+    index('printers_terminal_idx').on(table.orgId, table.terminalId),
+    foreignKey({
+      name: 'printers_org_id_terminal_id_fk',
+      columns: [table.orgId, table.terminalId],
+      foreignColumns: [packingTerminals.orgId, packingTerminals.id],
+    }).onDelete('restrict'),
+    check('printers_name_length', sql`length(${table.name}) between 1 and 60`),
+    check('printers_connection', sql`${table.connection} in ('ipp', 'ipps', 'raw', 'browser')`),
+    check('printers_language', sql`${table.language} in ('pdf', 'tspl', 'zpl', 'escpos')`),
+    check(
+      'printers_connection_language',
+      sql`(${table.connection} = 'raw') = (${table.language} <> 'pdf')`,
+    ),
+    // An IPv4 address on a private range, or none for a browser station (D-812).
+    check(
+      'printers_host',
+      sql`(${table.connection} = 'browser') = (${table.host} is null)
+          and (${table.host} is null or ${table.host} ~ '^(10\\.|172\\.(1[6-9]|2[0-9]|3[01])\\.|192\\.168\\.)[0-9.]+$')`,
+    ),
+    check('printers_port', sql`${table.port} is null or ${table.port} between 1 and 65535`),
+    check('printers_dpi', sql`${table.dpi} in (203, 300)`),
+    check('printers_medium', sql`${table.medium} in ('4x6', '100x150', 'a5', 'a4', 'custom')`),
+    check(
+      'printers_size',
+      sql`${table.widthUm} between 20000 and 330000 and ${table.heightUm} between 20000 and 1000000`,
+    ),
+    check(
+      'printers_documents',
+      sql`cardinality(${table.documents}) >= 1 and ${table.documents} <@ array['label', 'packing_slip']::text[]`,
+    ),
+    check('printers_copies', sql`${table.copies} between 1 and 5`),
+    check(
+      'printers_password_complete',
+      sql`(${table.passwordSealed} is null) = (${table.passwordFingerprint} is null)
+          and (${table.passwordSealed} is null or (${table.keyId} is not null and ${table.connection} = 'ipps'))`,
+    ),
+    check('printers_status', sql`${table.status} in ('unknown', 'online', 'offline', 'error')`),
+    check(
+      'printers_deleted',
+      sql`(${table.deletedAt} is null) = (${table.deletedBy} is null)
+          and (${table.deletedAt} is null or (not ${table.enabled} and ${table.passwordSealed} is null))`,
+    ),
+  ],
+);
+
+/**
+ * Every print, and so the print log (D-813, D-818): one document of one lot of one order on one
+ * printer, queued by the auto-print rule (`requested_by` null), a person, a reprint (with its
+ * reason) or a test page. Queued → sending → printed or failed; cancelled while waiting. What
+ * was printed, where and why never changes once written (a trigger holds it); only the job's
+ * progress moves. Never deleted.
+ */
+export const printJobs = packing.table(
+  'print_jobs',
+  {
+    id: primaryId,
+    orgId: uuid('org_id')
+      .notNull()
+      .references(() => organizations.id, { onDelete: 'restrict' }),
+    /** Null for a test page. */
+    orderId: uuid('order_id'),
+    orderNo: text('order_no').notNull().default(''),
+    document: text('document').notNull(),
+    lotNo: integer('lot_no').notNull().default(1),
+    lotCount: integer('lot_count').notNull().default(1),
+    printerId: uuid('printer_id').notNull(),
+    terminalId: uuid('terminal_id').notNull(),
+    source: text('source').notNull(),
+    reason: text('reason'),
+    requestedBy: text('requested_by').references(() => users.id, { onDelete: 'restrict' }),
+    copies: integer('copies').notNull().default(1),
+    consignmentNo: text('consignment_no'),
+    /** The auto-print rule's key (order, consignment, document, lot): one job each (D-817). */
+    autoKey: text('auto_key'),
+    state: text('state').notNull().default('queued'),
+    attempts: integer('attempts').notNull().default(0),
+    lastError: text('last_error'),
+    sendingAt: timestamp('sending_at', { withTimezone: true, mode: 'date' }),
+    printedAt: timestamp('printed_at', { withTimezone: true, mode: 'date' }),
+    failedAt: timestamp('failed_at', { withTimezone: true, mode: 'date' }),
+    cancelledAt: timestamp('cancelled_at', { withTimezone: true, mode: 'date' }),
+    /** The browser print station's computer, and who was signed in there (D-816). */
+    deviceId: uuid('device_id'),
+    confirmedBy: text('confirmed_by').references(() => users.id, { onDelete: 'restrict' }),
+    ...timestamps,
+  },
+  (table) => [
+    unique('print_jobs_org_id_id_key').on(table.orgId, table.id),
+    uniqueIndex('print_jobs_auto_key_idx').on(table.orgId, table.autoKey),
+    index('print_jobs_org_idx').on(table.orgId),
+    index('print_jobs_org_created_idx').on(table.orgId, table.createdAt),
+    index('print_jobs_order_idx').on(table.orgId, table.orderId, table.document, table.lotNo),
+    index('print_jobs_terminal_state_idx').on(table.orgId, table.terminalId, table.state),
+    index('print_jobs_printer_state_idx').on(table.orgId, table.printerId, table.state),
+    foreignKey({
+      name: 'print_jobs_org_id_order_id_fk',
+      columns: [table.orgId, table.orderId],
+      foreignColumns: [orders.orgId, orders.id],
+    }).onDelete('restrict'),
+    foreignKey({
+      name: 'print_jobs_org_id_printer_id_fk',
+      columns: [table.orgId, table.printerId],
+      foreignColumns: [printers.orgId, printers.id],
+    }).onDelete('restrict'),
+    foreignKey({
+      name: 'print_jobs_org_id_terminal_id_fk',
+      columns: [table.orgId, table.terminalId],
+      foreignColumns: [packingTerminals.orgId, packingTerminals.id],
+    }).onDelete('restrict'),
+    foreignKey({
+      name: 'print_jobs_org_id_device_id_fk',
+      columns: [table.orgId, table.deviceId],
+      foreignColumns: [packingTerminalDevices.orgId, packingTerminalDevices.id],
+    }).onDelete('restrict'),
+    check('print_jobs_document', sql`${table.document} in ('label', 'packing_slip', 'test')`),
+    check('print_jobs_source', sql`${table.source} in ('auto', 'manual', 'reprint', 'test')`),
+    check(
+      'print_jobs_state',
+      sql`${table.state} in ('queued', 'sending', 'printed', 'failed', 'cancelled')`,
+    ),
+    check(
+      'print_jobs_lots',
+      sql`${table.lotCount} between 1 and 20 and ${table.lotNo} between 1 and ${table.lotCount}`,
+    ),
+    check('print_jobs_copies', sql`${table.copies} between 1 and 5`),
+    check('print_jobs_attempts', sql`${table.attempts} between 0 and 20`),
+    check(
+      'print_jobs_who',
+      sql`(${table.source} = 'auto') = (${table.requestedBy} is null)
+          and (${table.source} = 'auto') = (${table.autoKey} is not null)`,
+    ),
+    check(
+      'print_jobs_reason',
+      sql`(${table.source} = 'reprint') = (${table.reason} is not null)
+          and (${table.reason} is null or length(${table.reason}) between 3 and 200)`,
+    ),
+    check(
+      'print_jobs_test',
+      sql`(${table.source} = 'test') = (${table.document} = 'test')
+          and (${table.document} = 'test') = (${table.orderId} is null)`,
+    ),
+    check(
+      'print_jobs_progress',
+      sql`(${table.state} = 'printed') = (${table.printedAt} is not null)
+          and (${table.state} = 'cancelled') = (${table.cancelledAt} is not null)`,
+    ),
+    check(
+      'print_jobs_error_length',
+      sql`${table.lastError} is null or length(${table.lastError}) <= 300`,
+    ),
+  ],
+);
+
+/**
+ * The brand's auto-print rule (D-817): one row, written the first time a supervisor saves.
+ * `auto_print` null reads as the ASSUMED default: on once the brand has a printer.
+ */
+export const labelSettings = packing.table(
+  'label_settings',
+  {
+    orgId: uuid('org_id')
+      .primaryKey()
+      .references(() => organizations.id, { onDelete: 'restrict' }),
+    autoPrint: boolean('auto_print'),
+    autoSlip: boolean('auto_slip').notNull().default(false),
+    updatedBy: text('updated_by')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    ...timestamps,
+  },
+  (table) => [index('label_settings_org_idx').on(table.orgId)],
+);
+
+/**
+ * Orders ready for their label (D-817, D-914): written in the confirm's transaction, then given
+ * the consignment in the courier's booking transaction, both through the orders module's parcel
+ * observer, so "Ready for label" never reads the courier's tables. The consignment as booked,
+ * null until then (and for good for an order nobody books here, an own rider's say); a later
+ * booking of the same order replaces it. `booked_at` is when the order became ready.
+ */
+export const labelOrders = packing.table(
+  'label_orders',
+  {
+    orgId: uuid('org_id')
+      .notNull()
+      .references(() => organizations.id, { onDelete: 'restrict' }),
+    orderId: uuid('order_id').notNull(),
+    orderNo: text('order_no').notNull().default(''),
+    consignmentNo: text('consignment_no'),
+    locationId: uuid('location_id'),
+    bookedAt: timestamp('booked_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+    ...timestamps,
+  },
+  (table) => [
+    primaryKey({ name: 'label_orders_pkey', columns: [table.orgId, table.orderId] }),
+    index('label_orders_org_booked_idx').on(table.orgId, table.bookedAt),
+    foreignKey({
+      name: 'label_orders_org_id_order_id_fk',
+      columns: [table.orgId, table.orderId],
+      foreignColumns: [orders.orgId, orders.id],
+    }).onDelete('restrict'),
+    check(
+      'label_orders_consignment_length',
+      sql`${table.consignmentNo} is null or length(${table.consignmentNo}) between 1 and 120`,
+    ),
+  ],
+);
+
+/** How many lots (bags) an order goes in (D-805). No row is one lot. */
+export const orderLots = packing.table(
+  'order_lots',
+  {
+    orgId: uuid('org_id')
+      .notNull()
+      .references(() => organizations.id, { onDelete: 'restrict' }),
+    orderId: uuid('order_id').notNull(),
+    lotCount: integer('lot_count').notNull(),
+    setBy: text('set_by')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    ...timestamps,
+  },
+  (table) => [
+    primaryKey({ name: 'order_lots_pkey', columns: [table.orgId, table.orderId] }),
+    index('order_lots_org_idx').on(table.orgId),
+    foreignKey({
+      name: 'order_lots_org_id_order_id_fk',
+      columns: [table.orgId, table.orderId],
+      foreignColumns: [orders.orgId, orders.id],
+    }).onDelete('restrict'),
+    check('order_lots_count', sql`${table.lotCount} between 1 and 20`),
+  ],
+);
+
+/** A lot closed at the packing station (D-807): the bag is sealed, the next one starts. */
+export const lotClosures = packing.table(
+  'lot_closures',
+  {
+    orgId: uuid('org_id')
+      .notNull()
+      .references(() => organizations.id, { onDelete: 'restrict' }),
+    sessionId: uuid('session_id').notNull(),
+    lotNo: integer('lot_no').notNull(),
+    closedBy: text('closed_by')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    closedAt: timestamp('closed_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+  },
+  (table) => [
+    primaryKey({
+      name: 'lot_closures_pkey',
+      columns: [table.orgId, table.sessionId, table.lotNo],
+    }),
+    index('lot_closures_org_idx').on(table.orgId),
+    // M57: a period's closed lots.
+    index('lot_closures_org_closed_idx').on(table.orgId, table.closedAt),
+    foreignKey({
+      name: 'lot_closures_org_id_session_id_fk',
+      columns: [table.orgId, table.sessionId],
+      foreignColumns: [packingSessions.orgId, packingSessions.id],
+    }).onDelete('restrict'),
+    check('lot_closures_lot_no', sql`${table.lotNo} between 1 and 20`),
+  ],
+);
+
+/** A lot's label scanned at the courier's handover (D-808): once per lot. */
+export const handoverScans = packing.table(
+  'handover_scans',
+  {
+    orgId: uuid('org_id')
+      .notNull()
+      .references(() => organizations.id, { onDelete: 'restrict' }),
+    orderId: uuid('order_id').notNull(),
+    lotNo: integer('lot_no').notNull(),
+    code: text('code').notNull(),
+    scannedBy: text('scanned_by')
+      .notNull()
+      .references(() => users.id, { onDelete: 'restrict' }),
+    scannedAt: timestamp('scanned_at', { withTimezone: true, mode: 'date' }).notNull().defaultNow(),
+    terminalId: uuid('terminal_id'),
+  },
+  (table) => [
+    primaryKey({
+      name: 'handover_scans_pkey',
+      columns: [table.orgId, table.orderId, table.lotNo],
+    }),
+    index('handover_scans_org_scanned_idx').on(table.orgId, table.scannedAt),
+    foreignKey({
+      name: 'handover_scans_org_id_order_id_fk',
+      columns: [table.orgId, table.orderId],
+      foreignColumns: [orders.orgId, orders.id],
+    }).onDelete('restrict'),
+    foreignKey({
+      name: 'handover_scans_org_id_terminal_id_fk',
+      columns: [table.orgId, table.terminalId],
+      foreignColumns: [packingTerminals.orgId, packingTerminals.id],
+    }).onDelete('restrict'),
+    check('handover_scans_lot_no', sql`${table.lotNo} between 1 and 20`),
+    check('handover_scans_code_length', sql`length(${table.code}) between 1 and 120`),
+  ],
+);

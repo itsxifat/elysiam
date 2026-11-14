@@ -1,0 +1,116 @@
+import { createRoute, lazyRouteComponent, type AnyRoute } from '@tanstack/react-router';
+
+import { buyerSearchSchema, orderListSearchSchema } from './search.js';
+
+/**
+ * M11's five order routes, as a factory the router calls.
+ *
+ * A factory rather than `createRoute` calls in `router.tsx`, for the reason every module
+ * since M06 gives: that file is edited concurrently, and a second write discards the first.
+ * M11's INTEGRATION section hands the integrator the lines that call this and the path to
+ * drop from the placeholder list (`/orders` is already in `NAVIGATION`).
+ *
+ * Every screen is `lazyRouteComponent` (`.claude/rules/frontend.md`, M05 check 5's bundle
+ * budget). The literal children — `/orders/new`, `/orders/queue`, `/orders/buyers` — are
+ * declared before the param route `/orders/$orderId`, so "new" is never read as an order
+ * id; TanStack ranks literals first anyway, and the order is what a reader checks.
+ *
+ * `validateSearch` on the two lists: their filters are a public interface the moment they
+ * are in the address bar, and a hand-edited one must fall back to the default view.
+ */
+export function ordersRoutes<TRoot extends AnyRoute>(rootRoute: TRoot) {
+  const list = createRoute({
+    getParentRoute: () => rootRoute,
+    path: '/orders',
+    validateSearch: orderListSearchSchema,
+    component: lazyRouteComponent(() => import('./order-list.js'), 'OrderListPage'),
+  });
+
+  const desk = createRoute({
+    getParentRoute: () => rootRoute,
+    path: '/orders/new',
+    // M42: `?conversation=<id>` starts the form from an inbox chat; the desk reads it itself.
+    component: lazyRouteComponent(() => import('./order-desk.js'), 'OrderDeskPage'),
+  });
+
+  const queue = createRoute({
+    getParentRoute: () => rootRoute,
+    path: '/orders/queue',
+    component: lazyRouteComponent(() => import('./queue.js'), 'OrderQueuePage'),
+  });
+
+  const buyers = createRoute({
+    getParentRoute: () => rootRoute,
+    path: '/orders/buyers',
+    validateSearch: buyerSearchSchema,
+    component: lazyRouteComponent(() => import('./buyers.js'), 'BuyerListPage'),
+  });
+
+  // M17: returns by reason. A literal, declared before the param route like the others.
+  const returns = createRoute({
+    getParentRoute: () => rootRoute,
+    path: '/orders/returns',
+    component: lazyRouteComponent(() => import('./returns.js'), 'ReturnReasonsPage'),
+  });
+
+  // M35b: scan a parcel to see what goes in it, and the phones signed in to the scanner app.
+  const scan = createRoute({
+    getParentRoute: () => rootRoute,
+    path: '/orders/scan',
+    component: lazyRouteComponent(() => import('./scan.js'), 'OrderScanPage'),
+  });
+
+  // M38b's packing station and M41's hub moved to their own areas (M46, D-800): an old
+  // link lands on Packaging, the open order with it.
+  const packing = createRoute({
+    getParentRoute: () => rootRoute,
+    path: '/orders/packing',
+    component: lazyRouteComponent(() => import('../labels/redirects.js'), 'ToPackaging'),
+  });
+
+  const hub = createRoute({
+    getParentRoute: () => rootRoute,
+    path: '/orders/hub',
+    component: lazyRouteComponent(() => import('../labels/redirects.js'), 'ToPackaging'),
+  });
+
+  const team = createRoute({
+    getParentRoute: () => rootRoute,
+    path: '/orders/team',
+    component: lazyRouteComponent(() => import('./team-board.js'), 'TeamBoardPage'),
+  });
+
+  const detail = createRoute({
+    getParentRoute: () => rootRoute,
+    path: '/orders/$orderId',
+    component: lazyRouteComponent(() => import('./order-detail.js'), 'OrderDetailPage'),
+  });
+
+  // M50 (D-921 to D-924): edit an order (or change a packed one), and return items from a parcel.
+  const edit = createRoute({
+    getParentRoute: () => rootRoute,
+    path: '/orders/$orderId/edit',
+    component: lazyRouteComponent(() => import('./order-edit.js'), 'OrderEditPage'),
+  });
+
+  const returnItems = createRoute({
+    getParentRoute: () => rootRoute,
+    path: '/orders/$orderId/return',
+    component: lazyRouteComponent(() => import('./order-return.js'), 'OrderReturnPage'),
+  });
+
+  return [
+    list,
+    desk,
+    queue,
+    buyers,
+    returns,
+    scan,
+    packing,
+    hub,
+    team,
+    detail,
+    edit,
+    returnItems,
+  ] as const;
+}

@@ -1,0 +1,127 @@
+{
+  "name": "@elysium/domain",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./money": {
+      "types": "./dist/money/index.d.ts",
+      "default": "./dist/money/index.js"
+    },
+    "./courier": {
+      "types": "./dist/courier/index.d.ts",
+      "default": "./dist/courier/index.js"
+    },
+    "./payroll": {
+      "types": "./dist/payroll/index.d.ts",
+      "default": "./dist/payroll/index.js"
+    },
+    "./investors": {
+      "types": "./dist/investors/index.d.ts",
+      "default": "./dist/investors/index.js"
+    },
+    "./posting/investors": {
+      "types": "./dist/posting/investors.d.ts",
+      "default": "./dist/posting/investors.js"
+    },
+    "./pos": {
+      "types": "./dist/pos/index.d.ts",
+      "default": "./dist/pos/index.js"
+    },
+    "./posting/pos": {
+      "types": "./dist/posting/pos.d.ts",
+      "default": "./dist/posting/pos.js"
+    },
+    "./promo": {
+      "types": "./dist/promo/index.d.ts",
+      "default": "./dist/promo/index.js"
+    },
+    "./crm": {
+      "types": "./dist/crm/index.d.ts",
+      "default": "./dist/crm/index.js"
+    },
+    "./notify": {
+      "types": "./dist/notify/index.d.ts",
+      "default": "./dist/notify/index.js"
+    },
+    "./marketing": {
+      "types": "./dist/marketing/index.d.ts",
+      "default": "./dist/marketing/index.js"
+    },
+    "./migration": {
+      "types": "./dist/migration/index.d.ts",
+      "default": "./dist/migration/index.js"
+    },
+    "./targets": {
+      "types": "./dist/targets/index.d.ts",
+      "default": "./dist/targets/index.js"
+    },
+    "./analytics": {
+      "types": "./dist/analytics/index.d.ts",
+      "default": "./dist/analytics/index.js"
+    },
+    "./loans": {
+      "types": "./dist/loans/index.d.ts",
+      "default": "./dist/loans/index.js"
+    },
+    "./iam": {
+      "types": "./dist/iam/index.d.ts",
+      "default": "./dist/iam/index.js"
+    },
+    "./storefront": {
+      "types": "./dist/storefront/index.d.ts",
+      "default": "./dist/storefront/index.js"
+    },
+    "./barcode": {
+      "types": "./dist/barcode/index.d.ts",
+      "default": "./dist/barcode/index.js"
+    },
+    "./packing": {
+      "types": "./dist/packing/index.d.ts",
+      "default": "./dist/packing/index.js"
+    },
+    "./pricing": {
+      "types": "./dist/pricing/index.d.ts",
+      "default": "./dist/pricing/index.js"
+    },
+    "./inbox": {
+      "types": "./dist/inbox/index.d.ts",
+      "default": "./dist/inbox/index.js"
+    },
+    "./assignment": {
+      "types": "./dist/assignment/index.d.ts",
+      "default": "./dist/assignment/index.js"
+    },
+    "./telephony": {
+      "types": "./dist/telephony/index.d.ts",
+      "default": "./dist/telephony/index.js"
+    },
+    "./tracking": {
+      "types": "./dist/tracking/index.d.ts",
+      "default": "./dist/tracking/index.js"
+    },
+    "./staff-activity": {
+      "types": "./dist/staff-activity/index.d.ts",
+      "default": "./dist/staff-activity/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -b",
+    "typecheck": "tsc -b",
+    "lint": "eslint .",
+    "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\""
+  },
+  "devDependencies": {
+    "fast-check": "catalog:",
+    "@elysium/config": "workspace:*",
+    "eslint": "catalog:",
+    "typescript": "catalog:"
+  }
+}

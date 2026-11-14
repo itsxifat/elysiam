@@ -1,0 +1,282 @@
+/*
+ * The design tokens (architecture §24, D-033; the design refresh, D-440).
+ *
+ * Every colour, radius, shadow and duration in this product resolves here. No
+ * component hard-codes a value, and no app reaches for a raw Tailwind palette
+ * class — the ESLint rule in packages/config enforces that.
+ *
+ * Colour is OKLCH so lightness is perceptually even. That is what lets the
+ * per-org brand accent (D-034) be one hue and one chroma, with every derived
+ * shade computed from them and its contrast intact.
+ *
+ * The direction (D-440): quiet and precise. A slightly warm neutral scale (hue
+ * 75, chroma under 0.006, the stone family) carries the chrome, the text and the
+ * surfaces; one deep ink accent, indigo-slate rather than a saturated blue, is
+ * kept for the primary action, focus and selection. Status colours are muted and
+ * live in the `-subtle` pairs, a tint behind a word, never a loud fill.
+ *
+ * Surfaces step rather than outline. The app's chrome (sidebar, topbar ground)
+ * sits on `--canvas`; the page sheet is `--background`; a card or a popover is one
+ * step up from that in the dark theme. Hairlines (`--border`) separate regions only
+ * where a step would not read.
+ *
+ * The section markers below are load-bearing: src/tokens/parse.ts reads them,
+ * and the test suite asserts that light and dark define exactly the same roles
+ * and that every foreground/background pair meets WCAG AA.
+ *
+ * Dark mode is applied by adding `.dark` to <html>. The values live in exactly
+ * one place; the app decides when to apply them from the OS preference and the
+ * user's choice.
+ */
+
+/* @tokens:static */
+:root {
+  /* Shape. 8px on controls (rounded-md), 10px on cards (rounded-lg), 14px on
+     dialogs and sheets (rounded-xl). Softly rounded, never a blob. */
+  --radius: 0.625rem;
+
+  /* Density (architecture §24). 40px table rows: comfortable to point at, still
+     a full screen of orders on a laptop. Controls stay at 36px so a filter row
+     and a button line up to the pixel. */
+  --row-height: 2.5rem;
+  --control-height: 2.25rem;
+  --control-height-sm: 2rem;
+  --control-height-lg: 2.5rem;
+
+  /* The shell's own measures, so the sidebar, the topbar and anything that sticks
+     under them agree on one number. */
+  --sidebar-width: 15rem;
+  --sidebar-width-collapsed: 3.75rem;
+  --topbar-height: 3.25rem;
+  /* A form or a detail page reads best at a measure; tables take the full width. */
+  --content-width-form: 48rem;
+  --content-width-page: 90rem;
+
+  /* Type. Inter carries Latin and every numeral; Hind Siliguri carries Bangla.
+     See fonts.css for the size-adjust that puts them on one baseline. */
+  --font-sans: 'Inter', 'Hind Siliguri', ui-sans-serif, system-ui, sans-serif;
+  --font-bangla: 'Hind Siliguri', 'Inter', ui-sans-serif, system-ui, sans-serif;
+  --font-mono: ui-monospace, 'SFMono-Regular', 'Menlo', 'Consolas', monospace;
+
+  /* Motion. Short, purposeful, ease-out. Anything longer reads as lag in a
+     tool someone drives all day. */
+  --duration-fast: 120ms;
+  --duration-base: 160ms;
+  --duration-slow: 180ms;
+  --ease-out: cubic-bezier(0.2, 0, 0, 1);
+  --ease-in-out: cubic-bezier(0.4, 0, 0.2, 1);
+  /* The live layer (M44a, D-765): a message settling in, a count popping with a little
+     overshoot, and the slow ambient loop of a presence dot or a ringing offer. Every one of
+     them stops under reduced motion. */
+  --duration-enter: 220ms;
+  --duration-pop: 280ms;
+  --duration-ambient: 2400ms;
+  --ease-spring: cubic-bezier(0.34, 1.36, 0.64, 1);
+
+  /* Depth. Regions separate with a surface step or a 1px hairline; shadows belong
+     only to layers that genuinely float above the page: a menu, a popover, a
+     dialog. The alphas are chosen to read on both themes. */
+  --shadow-popover:
+    0 0 0 1px oklch(0 0 0 / 0.03), 0 6px 16px -4px oklch(0 0 0 / 0.12),
+    0 2px 4px -2px oklch(0 0 0 / 0.06);
+  --shadow-dialog:
+    0 0 0 1px oklch(0 0 0 / 0.04), 0 24px 56px -12px oklch(0 0 0 / 0.22),
+    0 8px 16px -8px oklch(0 0 0 / 0.1);
+}
+
+/* @tokens:theme light */
+:root {
+  /* The brand triple. Per-org theming (D-034) overrides --brand-h and
+     --brand-c at runtime from org.organizations.brand; every shade below
+     follows automatically. --brand-l is fixed per theme because it is what
+     holds the contrast against the surface. The shipped accent is a deep ink,
+     indigo-slate (#394776), and an org's chroma is capped near it (D-441). */
+  --brand-h: 270;
+  --brand-c: 0.08;
+  --brand-l: 0.41;
+
+  /* The app's ground: the sidebar and the space around the page sheet. */
+  --canvas: oklch(0.975 0.0035 75);
+  --canvas-foreground: oklch(0.2 0.006 70);
+
+  --background: oklch(1 0 0);
+  --foreground: oklch(0.2 0.006 70);
+
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.2 0.006 70);
+
+  /* A code a camera reads (M40: the authenticator QR code). Dark on light in both themes:
+     phone scanners expect it, and an inverted code is missed by some. */
+  --scan-surface: oklch(1 0 0);
+  --scan-ink: oklch(0.15 0 0);
+
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.2 0.006 70);
+
+  --muted: oklch(0.968 0.003 75);
+  --muted-foreground: oklch(0.51 0.008 70);
+
+  --secondary: oklch(0.962 0.0035 75);
+  --secondary-foreground: oklch(0.24 0.006 70);
+
+  /* "accent" is the hover/active surface, not the brand. The brand is --primary. */
+  --accent: oklch(0.955 0.004 75);
+  --accent-foreground: oklch(0.2 0.006 70);
+
+  /* A selected item that is not an action: the active navigation entry, a chosen
+     filter, a selected row. Quieter than the brand, louder than a hover. */
+  --selected: oklch(0.93 0.005 75);
+  --selected-foreground: oklch(0.18 0.006 70);
+
+  --border: oklch(0.905 0.004 75);
+  /* A field's edge reads as an affordance; a divider should not. */
+  --input: oklch(0.86 0.005 75);
+
+  /* The scrim behind a dialog or a drawer. */
+  --overlay: oklch(0.2 0.006 70 / 0.32);
+
+  --primary: oklch(var(--brand-l) var(--brand-c) var(--brand-h));
+  /* The accent as text on the page: the fill itself, which clears 4.5:1 on white. */
+  --primary-text: oklch(var(--brand-l) var(--brand-c) var(--brand-h));
+  --primary-foreground: oklch(0.985 0.002 264);
+  /* On white, a filled button deepens as you press it. */
+  --primary-hover: oklch(calc(var(--brand-l) - 0.04) var(--brand-c) var(--brand-h));
+  --primary-active: oklch(calc(var(--brand-l) - 0.08) var(--brand-c) var(--brand-h));
+  /* A tint of the accent, for a selected tab or chip and the active nav icon's ground. */
+  --primary-subtle: oklch(0.955 calc(var(--brand-c) * 0.2) var(--brand-h));
+  --ring: oklch(calc(var(--brand-l) + 0.14) var(--brand-c) var(--brand-h));
+
+  --destructive: oklch(0.53 0.17 27);
+  /* An error as text on the page: the fill itself, which clears 4.5:1 on white. */
+  --destructive-text: oklch(0.53 0.17 27);
+  --destructive-foreground: oklch(0.985 0.002 264);
+  --success: oklch(0.52 0.1 155);
+  --success-foreground: oklch(0.985 0.002 264);
+  --warning: oklch(0.74 0.12 75);
+  --warning-foreground: oklch(0.24 0.04 75);
+  --info: oklch(0.52 0.09 250);
+  --info-foreground: oklch(0.985 0.002 264);
+
+  /* Subtle fills carry status badges, where colour is paired with a label and
+     never used alone (architecture §24 accessibility floor). Low chroma on
+     purpose: a table of eleven statuses should read calm, not as a rainbow. */
+  --destructive-subtle: oklch(0.965 0.016 27);
+  --destructive-subtle-foreground: oklch(0.47 0.13 27);
+  --success-subtle: oklch(0.965 0.018 155);
+  --success-subtle-foreground: oklch(0.42 0.08 155);
+  --warning-subtle: oklch(0.97 0.026 85);
+  --warning-subtle-foreground: oklch(0.45 0.08 65);
+  --info-subtle: oklch(0.965 0.014 250);
+  --info-subtle-foreground: oklch(0.44 0.08 250);
+
+  /* Charts: the accent for the series that matters, a neutral for comparison. */
+  --chart-1: oklch(var(--brand-l) var(--brand-c) var(--brand-h));
+  --chart-2: oklch(0.8 0.006 75);
+  --chart-grid: oklch(0.94 0.003 75);
+
+  /* Categorical series, for a chart with one line per entity (D-496). A fixed order,
+     never cycled: the order is what keeps neighbours apart for colour-blind readers
+     (worst adjacent CVD ΔE 9.1 light, 8.4 dark; validated on --card). Slots 3-5 sit
+     under 3:1 on the light card, so a chart using them also shows its values as a
+     table. Marks only: text never wears a series colour. */
+  --series-1: oklch(0.575 0.163 255.5);
+  --series-2: oklch(0.671 0.175 40.6);
+  --series-3: oklch(0.669 0.141 162.1);
+  --series-4: oklch(0.764 0.161 75.1);
+  --series-5: oklch(0.716 0.141 357.4);
+  --series-6: oklch(0.529 0.18 142.5);
+  --series-7: oklch(0.433 0.167 283.6);
+  --series-8: oklch(0.623 0.191 24.9);
+}
+
+/* @tokens:theme dark */
+.dark {
+  --brand-h: 270;
+  --brand-c: 0.1;
+  /* Bright enough to read against a charcoal surface, with headroom left so the
+     hover state can lift without pushing the white label under AA. */
+  --brand-l: 0.53;
+
+  /* A true neutral charcoal, never navy and never pure black: borders vanish
+     against #000 and it smears on OLED. */
+  --canvas: oklch(0.185 0.003 75);
+  --canvas-foreground: oklch(0.95 0.003 75);
+
+  --background: oklch(0.21 0.003 75);
+  --foreground: oklch(0.95 0.003 75);
+
+  --card: oklch(0.23 0.003 75);
+  --card-foreground: oklch(0.95 0.003 75);
+
+  /* Unchanged in the dark: a scanner needs dark modules on a light ground. */
+  --scan-surface: oklch(1 0 0);
+  --scan-ink: oklch(0.15 0 0);
+
+  --popover: oklch(0.24 0.004 75);
+  --popover-foreground: oklch(0.95 0.003 75);
+
+  --muted: oklch(0.255 0.004 75);
+  --muted-foreground: oklch(0.72 0.006 75);
+
+  --secondary: oklch(0.26 0.004 75);
+  --secondary-foreground: oklch(0.92 0.004 75);
+
+  --accent: oklch(0.27 0.004 75);
+  --accent-foreground: oklch(0.95 0.003 75);
+
+  --selected: oklch(0.29 0.005 75);
+  --selected-foreground: oklch(0.97 0.003 75);
+
+  --border: oklch(0.305 0.004 75);
+  --input: oklch(0.36 0.005 75);
+
+  --overlay: oklch(0.1 0.003 75 / 0.6);
+
+  --primary: oklch(var(--brand-l) var(--brand-c) var(--brand-h));
+  /* The accent as text on the page (M30): a link, a selected value. The fill's lightness is
+     solved for a white label, which on a dark surface leaves the same colour as text under
+     4.5:1, so text lifts well above it. */
+  --primary-text: oklch(calc(var(--brand-l) + 0.25) var(--brand-c) var(--brand-h));
+  --primary-foreground: oklch(0.985 0.002 264);
+  /* Hover lifts, press sinks. Lifting further would brighten the fill past the
+     point where a white label still clears AA, so press goes the other way —
+     which is also how a pressed control should read. */
+  --primary-hover: oklch(calc(var(--brand-l) + 0.02) var(--brand-c) var(--brand-h));
+  --primary-active: oklch(calc(var(--brand-l) - 0.04) var(--brand-c) var(--brand-h));
+  --primary-subtle: oklch(0.29 calc(var(--brand-c) * 0.35) var(--brand-h));
+  --ring: oklch(calc(var(--brand-l) + 0.12) var(--brand-c) var(--brand-h));
+
+  --destructive: oklch(0.55 0.17 27);
+  /* The fill is solved for a white label; as text on a dark surface it reads 3.2:1, so error
+     text lifts well above it (M38a's dark-theme axe pass), as `--primary-text` does. */
+  --destructive-text: oklch(0.72 0.15 27);
+  --destructive-foreground: oklch(0.985 0.002 264);
+  --success: oklch(0.66 0.11 155);
+  --success-foreground: oklch(0.18 0.006 75);
+  --warning: oklch(0.78 0.12 75);
+  --warning-foreground: oklch(0.2 0.035 75);
+  --info: oklch(0.68 0.09 250);
+  --info-foreground: oklch(0.18 0.006 75);
+
+  --destructive-subtle: oklch(0.27 0.035 27);
+  --destructive-subtle-foreground: oklch(0.82 0.08 27);
+  --success-subtle: oklch(0.265 0.03 155);
+  --success-subtle-foreground: oklch(0.82 0.09 155);
+  --warning-subtle: oklch(0.275 0.03 80);
+  --warning-subtle-foreground: oklch(0.86 0.09 85);
+  --info-subtle: oklch(0.27 0.03 250);
+  --info-subtle-foreground: oklch(0.83 0.07 250);
+
+  --chart-1: oklch(calc(var(--brand-l) + 0.13) var(--brand-c) var(--brand-h));
+  --chart-2: oklch(0.45 0.006 75);
+  --chart-grid: oklch(0.28 0.004 75);
+
+  --series-1: oklch(0.622 0.161 255.1);
+  --series-2: oklch(0.622 0.173 40.1);
+  --series-3: oklch(0.621 0.128 163.1);
+  --series-4: oklch(0.67 0.143 73.2);
+  --series-5: oklch(0.622 0.171 0.8);
+  --series-6: oklch(0.529 0.18 142.5);
+  --series-7: oklch(0.67 0.145 286.8);
+  --series-8: oklch(0.669 0.159 22.3);
+}

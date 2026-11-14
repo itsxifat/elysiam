@@ -1,0 +1,1252 @@
+{
+  "version": "7",
+  "dialect": "postgresql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "7",
+      "when": 1789928432956,
+      "tag": "0000_org_and_ref_schema",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1789928433796,
+      "tag": "0001_tenant_isolation_policies",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1789960497307,
+      "tag": "0002_composite_tenant_foreign_keys",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1789963736264,
+      "tag": "0003_iam_identity",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1789963754953,
+      "tag": "0004_iam_policies",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1789963788225,
+      "tag": "0005_membership_branches_composite_fk",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1790000000000,
+      "tag": "0006_revoke_analytics_identity_reads",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1790171562975,
+      "tag": "0007_audit_approvals_demo",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1790171563975,
+      "tag": "0008_audit_approvals_policies",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1790171564975,
+      "tag": "0009_approval_immutability",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1790257364900,
+      "tag": "0010_approvals_branch_and_auto_approval",
+      "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1790259762105,
+      "tag": "0011_approval_controls",
+      "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1790261441663,
+      "tag": "0012_approval_lineage",
+      "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "7",
+      "when": 1790263208114,
+      "tag": "0013_ledger_schema",
+      "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "7",
+      "when": 1790263217110,
+      "tag": "0014_ledger_integrity",
+      "breakpoints": true
+    },
+    {
+      "idx": 15,
+      "version": "7",
+      "when": 1790265829137,
+      "tag": "0015_ledger_hardening",
+      "breakpoints": true
+    },
+    {
+      "idx": 16,
+      "version": "7",
+      "when": 1790265911610,
+      "tag": "0016_journal_reversal_shape",
+      "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "7",
+      "when": 1790314153578,
+      "tag": "0017_events_outbox",
+      "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "7",
+      "when": 1790314154578,
+      "tag": "0018_events_outbox_policies",
+      "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "7",
+      "when": 1790317000000,
+      "tag": "0019_files_objects",
+      "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "7",
+      "when": 1790317001000,
+      "tag": "0020_files_objects_policies",
+      "breakpoints": true
+    },
+    {
+      "idx": 21,
+      "version": "7",
+      "when": 1790317633190,
+      "tag": "0021_http_idempotency",
+      "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "7",
+      "when": 1790317634190,
+      "tag": "0023_catalog_schema",
+      "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "7",
+      "when": 1790317635190,
+      "tag": "0024_catalog_policies",
+      "breakpoints": true
+    },
+    {
+      "idx": 25,
+      "version": "7",
+      "when": 1790317636190,
+      "tag": "0025_catalog_search",
+      "breakpoints": true
+    },
+    {
+      "idx": 26,
+      "version": "7",
+      "when": 1790317637190,
+      "tag": "0026_catalog_integrity",
+      "breakpoints": true
+    },
+    {
+      "idx": 27,
+      "version": "7",
+      "when": 1790317638190,
+      "tag": "0027_wallets_schema",
+      "breakpoints": true
+    },
+    {
+      "idx": 28,
+      "version": "7",
+      "when": 1790317639190,
+      "tag": "0028_wallets_policies",
+      "breakpoints": true
+    },
+    {
+      "idx": 29,
+      "version": "7",
+      "when": 1790317640190,
+      "tag": "0029_wallets_integrity",
+      "breakpoints": true
+    },
+    {
+      "idx": 30,
+      "version": "7",
+      "when": 1790317641190,
+      "tag": "0030_ledger_analytics_reads",
+      "breakpoints": true
+    },
+    {
+      "idx": 31,
+      "version": "7",
+      "when": 1790317642190,
+      "tag": "0031_inventory_schema",
+      "breakpoints": true
+    },
+    {
+      "idx": 32,
+      "version": "7",
+      "when": 1790317643190,
+      "tag": "0032_inventory_policies",
+      "breakpoints": true
+    },
+    {
+      "idx": 33,
+      "version": "7",
+      "when": 1790317644190,
+      "tag": "0033_inventory_integrity",
+      "breakpoints": true
+    },
+    {
+      "idx": 34,
+      "version": "7",
+      "when": 1790317645190,
+      "tag": "0034_approvals_branch_scope",
+      "breakpoints": true
+    },
+    {
+      "idx": 35,
+      "version": "7",
+      "when": 1790317646190,
+      "tag": "0035_supply_schema",
+      "breakpoints": true
+    },
+    {
+      "idx": 36,
+      "version": "7",
+      "when": 1790317647190,
+      "tag": "0036_supply_policies",
+      "breakpoints": true
+    },
+    {
+      "idx": 37,
+      "version": "7",
+      "when": 1790317648190,
+      "tag": "0037_supply_integrity",
+      "breakpoints": true
+    },
+    {
+      "idx": 38,
+      "version": "7",
+      "when": 1790317649190,
+      "tag": "0038_supply_search",
+      "breakpoints": true
+    },
+    {
+      "idx": 39,
+      "version": "7",
+      "when": 1790317650190,
+      "tag": "0039_orders_schema",
+      "breakpoints": true
+    },
+    {
+      "idx": 40,
+      "version": "7",
+      "when": 1790317651190,
+      "tag": "0040_orders_policies",
+      "breakpoints": true
+    },
+    {
+      "idx": 41,
+      "version": "7",
+      "when": 1790317652190,
+      "tag": "0041_orders_integrity",
+      "breakpoints": true
+    },
+    {
+      "idx": 42,
+      "version": "7",
+      "when": 1790317653190,
+      "tag": "0042_orders_delivery_zone_defaults",
+      "breakpoints": true
+    },
+    {
+      "idx": 43,
+      "version": "7",
+      "when": 1790317654190,
+      "tag": "0043_orders_search",
+      "breakpoints": true
+    },
+    {
+      "idx": 44,
+      "version": "7",
+      "when": 1790317655190,
+      "tag": "0044_orders_line_edit",
+      "breakpoints": true
+    },
+    {
+      "idx": 45,
+      "version": "7",
+      "when": 1790317656190,
+      "tag": "0045_fraud_schema",
+      "breakpoints": true
+    },
+    {
+      "idx": 46,
+      "version": "7",
+      "when": 1790317657190,
+      "tag": "0046_fraud_policies",
+      "breakpoints": true
+    },
+    {
+      "idx": 47,
+      "version": "7",
+      "when": 1790317658190,
+      "tag": "0047_fraud_integrity",
+      "breakpoints": true
+    },
+    {
+      "idx": 48,
+      "version": "7",
+      "when": 1790317659190,
+      "tag": "0048_courier_schema",
+      "breakpoints": true
+    },
+    {
+      "idx": 49,
+      "version": "7",
+      "when": 1790317660190,
+      "tag": "0049_courier_policies",
+      "breakpoints": true
+    },
+    {
+      "idx": 50,
+      "version": "7",
+      "when": 1790317661190,
+      "tag": "0050_courier_integrity",
+      "breakpoints": true
+    },
+    {
+      "idx": 51,
+      "version": "7",
+      "when": 1790317662190,
+      "tag": "0051_courier_settlement_controls",
+      "breakpoints": true
+    },
+    {
+      "idx": 52,
+      "version": "7",
+      "when": 1790317671190,
+      "tag": "0052_courier_settlement_binding",
+      "breakpoints": true
+    },
+    {
+      "idx": 53,
+      "version": "7",
+      "when": 1790317663190,
+      "tag": "0053_hr_schema",
+      "breakpoints": true
+    },
+    {
+      "idx": 54,
+      "version": "7",
+      "when": 1790317664190,
+      "tag": "0054_hr_policies",
+      "breakpoints": true
+    },
+    {
+      "idx": 55,
+      "version": "7",
+      "when": 1790317665190,
+      "tag": "0055_hr_integrity",
+      "breakpoints": true
+    },
+    {
+      "idx": 56,
+      "version": "7",
+      "when": 1790317666190,
+      "tag": "0056_hr_payroll_approval_link",
+      "breakpoints": true
+    },
+    {
+      "idx": 57,
+      "version": "7",
+      "when": 1790317667190,
+      "tag": "0057_hr_default_calendars",
+      "breakpoints": true
+    },
+    {
+      "idx": 58,
+      "version": "7",
+      "when": 1790317668190,
+      "tag": "0058_investors_schema",
+      "breakpoints": true
+    },
+    {
+      "idx": 59,
+      "version": "7",
+      "when": 1790317669190,
+      "tag": "0059_investors_policies",
+      "breakpoints": true
+    },
+    {
+      "idx": 60,
+      "version": "7",
+      "when": 1790317670190,
+      "tag": "0060_investors_integrity",
+      "breakpoints": true
+    },
+    {
+      "idx": 61,
+      "version": "7",
+      "when": 1790366802635,
+      "tag": "0061_schema_baseline",
+      "breakpoints": true
+    },
+    {
+      "idx": 62,
+      "version": "7",
+      "when": 1790366803635,
+      "tag": "0062_intake_schema",
+      "breakpoints": true
+    },
+    {
+      "idx": 63,
+      "version": "7",
+      "when": 1790366804635,
+      "tag": "0063_intake_policies",
+      "breakpoints": true
+    },
+    {
+      "idx": 64,
+      "version": "7",
+      "when": 1790366805635,
+      "tag": "0064_orders_desk_indexes",
+      "breakpoints": true
+    },
+    {
+      "idx": 65,
+      "version": "7",
+      "when": 1790366807635,
+      "tag": "0065_courier_m15_schema",
+      "breakpoints": true
+    },
+    {
+      "idx": 66,
+      "version": "7",
+      "when": 1790366808635,
+      "tag": "0066_courier_m15_policies",
+      "breakpoints": true
+    },
+    {
+      "idx": 67,
+      "version": "7",
+      "when": 1790366809635,
+      "tag": "0067_courier_m15_integrity",
+      "breakpoints": true
+    },
+    {
+      "idx": 68,
+      "version": "7",
+      "when": 1790366810635,
+      "tag": "0068_pos_schema",
+      "breakpoints": true
+    },
+    {
+      "idx": 69,
+      "version": "7",
+      "when": 1790366811635,
+      "tag": "0069_pos_policies",
+      "breakpoints": true
+    },
+    {
+      "idx": 70,
+      "version": "7",
+      "when": 1790366812635,
+      "tag": "0070_pos_integrity",
+      "breakpoints": true
+    },
+    {
+      "idx": 72,
+      "version": "7",
+      "when": 1790366806635,
+      "tag": "0072_outbox_retry_schedule",
+      "breakpoints": true
+    },
+    {
+      "idx": 73,
+      "version": "7",
+      "when": 1790366813635,
+      "tag": "0073_pos_hold_outside_shift",
+      "breakpoints": true
+    },
+    {
+      "idx": 74,
+      "version": "7",
+      "when": 1790790616906,
+      "tag": "0074_schema_baseline_m11_m23",
+      "breakpoints": true
+    },
+    {
+      "idx": 75,
+      "version": "7",
+      "when": 1790813928297,
+      "tag": "0075_pos_exchange_pairing",
+      "breakpoints": true
+    },
+    {
+      "idx": 76,
+      "version": "7",
+      "when": 1790814335576,
+      "tag": "0076_wallets_one_receipt_per_entry",
+      "breakpoints": true
+    },
+    {
+      "idx": 77,
+      "version": "7",
+      "when": 1790817679518,
+      "tag": "0077_m16_crm_promo_notify_schema",
+      "breakpoints": true
+    },
+    {
+      "idx": 78,
+      "version": "7",
+      "when": 1790817692721,
+      "tag": "0078_m16_crm_promo_notify_policies",
+      "breakpoints": true
+    },
+    {
+      "idx": 79,
+      "version": "7",
+      "when": 1790817694089,
+      "tag": "0079_m16_crm_promo_notify_integrity",
+      "breakpoints": true
+    },
+    {
+      "idx": 80,
+      "version": "7",
+      "when": 1790923793755,
+      "tag": "0080_remove_fraud",
+      "breakpoints": true
+    },
+    {
+      "idx": 81,
+      "version": "7",
+      "when": 1790924340317,
+      "tag": "0081_m14a_schema",
+      "breakpoints": true
+    },
+    {
+      "idx": 82,
+      "version": "7",
+      "when": 1790924341557,
+      "tag": "0082_m14a_migration_policies",
+      "breakpoints": true
+    },
+    {
+      "idx": 83,
+      "version": "7",
+      "when": 1790924342770,
+      "tag": "0083_m14a_opening_equity_shape",
+      "breakpoints": true
+    },
+    {
+      "idx": 84,
+      "version": "7",
+      "when": 1790929942987,
+      "tag": "0084_m18_marketing_schema",
+      "breakpoints": true
+    },
+    {
+      "idx": 85,
+      "version": "7",
+      "when": 1790929945132,
+      "tag": "0085_m18_marketing_policies",
+      "breakpoints": true
+    },
+    {
+      "idx": 86,
+      "version": "7",
+      "when": 1790929948208,
+      "tag": "0086_m18_marketing_integrity",
+      "breakpoints": true
+    },
+    {
+      "idx": 87,
+      "version": "7",
+      "when": 1790930655698,
+      "tag": "0087_m17_advances_returns_schema",
+      "breakpoints": true
+    },
+    {
+      "idx": 88,
+      "version": "7",
+      "when": 1790930657194,
+      "tag": "0088_m17_advances_returns_policies",
+      "breakpoints": true
+    },
+    {
+      "idx": 89,
+      "version": "7",
+      "when": 1790931941596,
+      "tag": "0089_m20_targets_schema",
+      "breakpoints": true
+    },
+    {
+      "idx": 90,
+      "version": "7",
+      "when": 1790931943076,
+      "tag": "0090_m20_targets_policies",
+      "breakpoints": true
+    },
+    {
+      "idx": 91,
+      "version": "7",
+      "when": 1790931944623,
+      "tag": "0091_m20_targets_integrity",
+      "breakpoints": true
+    },
+    {
+      "idx": 92,
+      "version": "7",
+      "when": 1790933493366,
+      "tag": "0092_m24_analytics_schema",
+      "breakpoints": true
+    },
+    {
+      "idx": 93,
+      "version": "7",
+      "when": 1790933503069,
+      "tag": "0093_m24_analytics_policies",
+      "breakpoints": true
+    },
+    {
+      "idx": 94,
+      "version": "7",
+      "when": 1790940103208,
+      "tag": "0094_m26_loans_schema",
+      "breakpoints": true
+    },
+    {
+      "idx": 95,
+      "version": "7",
+      "when": 1790940104870,
+      "tag": "0095_m26_loans_policies",
+      "breakpoints": true
+    },
+    {
+      "idx": 96,
+      "version": "7",
+      "when": 1790940106474,
+      "tag": "0096_m26_loan_integrity",
+      "breakpoints": true
+    },
+    {
+      "idx": 97,
+      "version": "7",
+      "when": 1790940108180,
+      "tag": "0097_m26_loan_void_guards",
+      "breakpoints": true
+    },
+    {
+      "idx": 98,
+      "version": "7",
+      "when": 1790952316684,
+      "tag": "0098_gaps_users_auth_schema",
+      "breakpoints": true
+    },
+    {
+      "idx": 99,
+      "version": "7",
+      "when": 1790952350806,
+      "tag": "0099_gaps_users_auth_policies",
+      "breakpoints": true
+    },
+    {
+      "idx": 100,
+      "version": "7",
+      "when": 1790956707757,
+      "tag": "0100_gaps_users_auth_lineage",
+      "breakpoints": true
+    },
+    {
+      "idx": 101,
+      "version": "7",
+      "when": 1790956746338,
+      "tag": "0101_gaps_users_auth_lineage_policies",
+      "breakpoints": true
+    },
+    {
+      "idx": 102,
+      "version": "7",
+      "when": 1790967531452,
+      "tag": "0102_m30_followups_identity",
+      "breakpoints": true
+    },
+    {
+      "idx": 103,
+      "version": "7",
+      "when": 1791191670587,
+      "tag": "0103_m33_storefront_schema",
+      "breakpoints": true
+    },
+    {
+      "idx": 104,
+      "version": "7",
+      "when": 1791191708968,
+      "tag": "0104_m33_storefront_policies",
+      "breakpoints": true
+    },
+    {
+      "idx": 105,
+      "version": "7",
+      "when": 1791201042694,
+      "tag": "0105_m31_owner_link",
+      "breakpoints": true
+    },
+    {
+      "idx": 106,
+      "version": "7",
+      "when": 1791201057694,
+      "tag": "0106_m31_owner_link_grants",
+      "breakpoints": true
+    },
+    {
+      "idx": 107,
+      "version": "7",
+      "when": 1791201063183,
+      "tag": "0107_m31_owner_link_hardening",
+      "breakpoints": true
+    },
+    {
+      "idx": 108,
+      "version": "7",
+      "when": 1791201068177,
+      "tag": "0108_m31_owner_no_password",
+      "breakpoints": true
+    },
+    {
+      "idx": 109,
+      "version": "7",
+      "when": 1791201679916,
+      "tag": "0109_m35a_offers_schema",
+      "breakpoints": true
+    },
+    {
+      "idx": 110,
+      "version": "7",
+      "when": 1791201696768,
+      "tag": "0110_m35a_offers_policies",
+      "breakpoints": true
+    },
+    {
+      "idx": 111,
+      "version": "7",
+      "when": 1791201701888,
+      "tag": "0111_m35a_offers_integrity",
+      "breakpoints": true
+    },
+    {
+      "idx": 112,
+      "version": "7",
+      "when": 1791201705829,
+      "tag": "0112_m35a_flash_claim_lines",
+      "breakpoints": true
+    },
+    {
+      "idx": 113,
+      "version": "7",
+      "when": 1791205829985,
+      "tag": "0113_m38a_barcodes_stock_in_hand",
+      "breakpoints": true
+    },
+    {
+      "idx": 114,
+      "version": "7",
+      "when": 1791205838986,
+      "tag": "0114_m38a_policies",
+      "breakpoints": true
+    },
+    {
+      "idx": 115,
+      "version": "7",
+      "when": 1791212999147,
+      "tag": "0115_m34_buying_schema",
+      "breakpoints": true
+    },
+    {
+      "idx": 116,
+      "version": "7",
+      "when": 1791213009333,
+      "tag": "0116_m34_buying_policies",
+      "breakpoints": true
+    },
+    {
+      "idx": 117,
+      "version": "7",
+      "when": 1791213012330,
+      "tag": "0117_m34_session_validating",
+      "breakpoints": true
+    },
+    {
+      "idx": 118,
+      "version": "7",
+      "when": 1791217437208,
+      "tag": "0118_m39a_delete_archive_schema",
+      "breakpoints": true
+    },
+    {
+      "idx": 119,
+      "version": "7",
+      "when": 1791217444034,
+      "tag": "0119_m39a_delete_archive_policies",
+      "breakpoints": true
+    },
+    {
+      "idx": 120,
+      "version": "7",
+      "when": 1791226706882,
+      "tag": "0120_m39b_variant_pricing_schema",
+      "breakpoints": true
+    },
+    {
+      "idx": 121,
+      "version": "7",
+      "when": 1791226717010,
+      "tag": "0121_m39b_variant_pricing_policies",
+      "breakpoints": true
+    },
+    {
+      "idx": 122,
+      "version": "7",
+      "when": 1791233050281,
+      "tag": "0122_m35b_web_marketing_schema",
+      "breakpoints": true
+    },
+    {
+      "idx": 123,
+      "version": "7",
+      "when": 1791233059192,
+      "tag": "0123_m35b_web_marketing_policies",
+      "breakpoints": true
+    },
+    {
+      "idx": 124,
+      "version": "7",
+      "when": 1791233061961,
+      "tag": "0124_m35b_holds_final_events_purge",
+      "breakpoints": true
+    },
+    {
+      "idx": 125,
+      "version": "7",
+      "when": 1791360923192,
+      "tag": "0125_trust_votes_schema",
+      "breakpoints": true
+    },
+    {
+      "idx": 126,
+      "version": "7",
+      "when": 1791360926085,
+      "tag": "0126_trust_votes_policies",
+      "breakpoints": true
+    },
+    {
+      "idx": 127,
+      "version": "7",
+      "when": 1791363316956,
+      "tag": "0127_super_admin_votes_schema",
+      "breakpoints": true
+    },
+    {
+      "idx": 128,
+      "version": "7",
+      "when": 1791363325377,
+      "tag": "0128_super_admin_votes_policies",
+      "breakpoints": true
+    },
+    {
+      "idx": 129,
+      "version": "7",
+      "when": 1791382507489,
+      "tag": "0129_m38b_pack_video_schema",
+      "breakpoints": true
+    },
+    {
+      "idx": 130,
+      "version": "7",
+      "when": 1791382518042,
+      "tag": "0130_m38b_pack_video_policies",
+      "breakpoints": true
+    },
+    {
+      "idx": 131,
+      "version": "7",
+      "when": 1791382786374,
+      "tag": "0131_reporting_reads",
+      "breakpoints": true
+    },
+    {
+      "idx": 132,
+      "version": "7",
+      "when": 1791385814663,
+      "tag": "0132_reporting_reads_narrower",
+      "breakpoints": true
+    },
+    {
+      "idx": 133,
+      "version": "7",
+      "when": 1791396184342,
+      "tag": "0133_m38b_scans_append_only",
+      "breakpoints": true
+    },
+    {
+      "idx": 134,
+      "version": "7",
+      "when": 1791429691885,
+      "tag": "0134_m38c_ip_camera_schema",
+      "breakpoints": true
+    },
+    {
+      "idx": 135,
+      "version": "7",
+      "when": 1791429707582,
+      "tag": "0135_m38c_ip_camera_policies",
+      "breakpoints": true
+    },
+    {
+      "idx": 136,
+      "version": "7",
+      "when": 1791447482722,
+      "tag": "0136_m38c_camera_audit_fixes",
+      "breakpoints": true
+    },
+    {
+      "idx": 137,
+      "version": "7",
+      "when": 1791464613842,
+      "tag": "0137_m38c_camera_preview_delete",
+      "breakpoints": true
+    },
+    {
+      "idx": 138,
+      "version": "7",
+      "when": 1791645998152,
+      "tag": "0138_super_admin_removal_votes_schema",
+      "breakpoints": true
+    },
+    {
+      "idx": 139,
+      "version": "7",
+      "when": 1791646005836,
+      "tag": "0139_super_admin_removal_policies",
+      "breakpoints": true
+    },
+    {
+      "idx": 140,
+      "version": "7",
+      "when": 1791702420697,
+      "tag": "0140_m40_two_factor_enabled_at",
+      "breakpoints": true
+    },
+    {
+      "idx": 141,
+      "version": "7",
+      "when": 1791702429043,
+      "tag": "0141_m40_two_factor_enabled_at_stamp",
+      "breakpoints": true
+    },
+    {
+      "idx": 142,
+      "version": "7",
+      "when": 1791738952004,
+      "tag": "0142_m42_inbox_schema",
+      "breakpoints": true
+    },
+    {
+      "idx": 143,
+      "version": "7",
+      "when": 1791738968206,
+      "tag": "0143_m42_inbox_policies",
+      "breakpoints": true
+    },
+    {
+      "idx": 144,
+      "version": "7",
+      "when": 1791754272096,
+      "tag": "0144_m41_order_workflow_schema",
+      "breakpoints": true
+    },
+    {
+      "idx": 145,
+      "version": "7",
+      "when": 1791754286986,
+      "tag": "0145_m41_order_workflow_policies",
+      "breakpoints": true
+    },
+    {
+      "idx": 146,
+      "version": "7",
+      "when": 1791756534440,
+      "tag": "0146_m43_english_defaults",
+      "breakpoints": true
+    },
+    {
+      "idx": 147,
+      "version": "7",
+      "when": 1791756865696,
+      "tag": "0147_m42_conversation_offers_schema",
+      "breakpoints": true
+    },
+    {
+      "idx": 148,
+      "version": "7",
+      "when": 1791756879815,
+      "tag": "0148_m42_conversation_offers_policies",
+      "breakpoints": true
+    },
+    {
+      "idx": 149,
+      "version": "7",
+      "when": 1791793723470,
+      "tag": "0149_m44a_inbox_profiles_saved_replies",
+      "breakpoints": true
+    },
+    {
+      "idx": 150,
+      "version": "7",
+      "when": 1791793726378,
+      "tag": "0150_m44a_saved_replies_policies",
+      "breakpoints": true
+    },
+    {
+      "idx": 151,
+      "version": "7",
+      "when": 1791794338668,
+      "tag": "0151_m45_voice_calls_schema",
+      "breakpoints": true
+    },
+    {
+      "idx": 152,
+      "version": "7",
+      "when": 1791794352451,
+      "tag": "0152_m45_voice_calls_policies",
+      "breakpoints": true
+    },
+    {
+      "idx": 153,
+      "version": "7",
+      "when": 1792190617677,
+      "tag": "0153_m46_labels_packaging_schema",
+      "breakpoints": true
+    },
+    {
+      "idx": 154,
+      "version": "7",
+      "when": 1792190641770,
+      "tag": "0154_m46_labels_packaging_policies",
+      "breakpoints": true
+    },
+    {
+      "idx": 155,
+      "version": "7",
+      "when": 1792319465286,
+      "tag": "0155_m47_telephony_schema",
+      "breakpoints": true
+    },
+    {
+      "idx": 156,
+      "version": "7",
+      "when": 1792319468133,
+      "tag": "0156_m47_telephony_policies",
+      "breakpoints": true
+    },
+    {
+      "idx": 157,
+      "version": "7",
+      "when": 1792350824550,
+      "tag": "0157_m47_owner_answers_schema",
+      "breakpoints": true
+    },
+    {
+      "idx": 158,
+      "version": "7",
+      "when": 1792350870680,
+      "tag": "0158_m47_owner_answers_policies",
+      "breakpoints": true
+    },
+    {
+      "idx": 159,
+      "version": "7",
+      "when": 1792383508307,
+      "tag": "0159_m48_customer_numbers_schema",
+      "breakpoints": true
+    },
+    {
+      "idx": 160,
+      "version": "7",
+      "when": 1792383534101,
+      "tag": "0160_m48_customer_numbers_policies",
+      "breakpoints": true
+    },
+    {
+      "idx": 161,
+      "version": "7",
+      "when": 1792403453428,
+      "tag": "0161_m49_customer_email",
+      "breakpoints": true
+    },
+    {
+      "idx": 162,
+      "version": "7",
+      "when": 1792802423907,
+      "tag": "0162_steadfast_pending_with_courier",
+      "breakpoints": true
+    },
+    {
+      "idx": 163,
+      "version": "7",
+      "when": 1792830653778,
+      "tag": "0163_d914_label_on_confirm",
+      "breakpoints": true
+    },
+    {
+      "idx": 164,
+      "version": "7",
+      "when": 1793460466228,
+      "tag": "0164_m50_order_edit_replace",
+      "breakpoints": true
+    },
+    {
+      "idx": 165,
+      "version": "7",
+      "when": 1793532170018,
+      "tag": "0165_m51_label_recording",
+      "breakpoints": true
+    },
+    {
+      "idx": 166,
+      "version": "7",
+      "when": 1793532174462,
+      "tag": "0166_m51_label_recording_policies",
+      "breakpoints": true
+    },
+    {
+      "idx": 167,
+      "version": "7",
+      "when": 1793556833593,
+      "tag": "0167_m52_lot_ask",
+      "breakpoints": true
+    },
+    {
+      "idx": 168,
+      "version": "7",
+      "when": 1794133481339,
+      "tag": "0168_address_one_line",
+      "breakpoints": true
+    },
+    {
+      "idx": 169,
+      "version": "7",
+      "when": 1794136364279,
+      "tag": "0169_permission_only_decisions",
+      "breakpoints": true
+    },
+    {
+      "idx": 170,
+      "version": "7",
+      "when": 1794136378799,
+      "tag": "0170_permission_only_functions",
+      "breakpoints": true
+    },
+    {
+      "idx": 171,
+      "version": "7",
+      "when": 1794140631595,
+      "tag": "0171_adjustment_cause",
+      "breakpoints": true
+    },
+    {
+      "idx": 172,
+      "version": "7",
+      "when": 1794249353136,
+      "tag": "0172_m54_tracking_schema",
+      "breakpoints": true
+    },
+    {
+      "idx": 173,
+      "version": "7",
+      "when": 1794249361263,
+      "tag": "0173_m54_tracking_policies",
+      "breakpoints": true
+    },
+    {
+      "idx": 174,
+      "version": "7",
+      "when": 1794290255726,
+      "tag": "0174_m57_staff_activity_schema",
+      "breakpoints": true
+    },
+    {
+      "idx": 175,
+      "version": "7",
+      "when": 1794290279944,
+      "tag": "0175_m57_staff_activity_policies",
+      "breakpoints": true
+    },
+    {
+      "idx": 176,
+      "version": "7",
+      "when": 1794291397290,
+      "tag": "0176_m57_staff_activity_indexes",
+      "breakpoints": true
+    },
+    {
+      "idx": 177,
+      "version": "7",
+      "when": 1794293557761,
+      "tag": "0177_m57_bonus_mistakes",
+      "breakpoints": true
+    },
+    {
+      "idx": 178,
+      "version": "7",
+      "when": 1794567465814,
+      "tag": "0178_staff_removal",
+      "breakpoints": true
+    },
+    {
+      "idx": 179,
+      "version": "7",
+      "when": 1794573096890,
+      "tag": "0179_print_not_printed",
+      "breakpoints": true
+    }
+  ]
+}

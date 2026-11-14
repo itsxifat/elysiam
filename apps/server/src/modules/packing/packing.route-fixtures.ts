@@ -1,0 +1,248 @@
+import { createHash, randomUUID } from 'node:crypto';
+
+import { SEED_ORG_IDS, withGlobal, withSystem } from '@elysium/db';
+import { sql } from 'drizzle-orm';
+
+/**
+ * How the route-matrix suite and the cost sweep call M35b's packing routes (D-070): the
+ * console's scanner lookup and devices, and the label sheet (asked for an order that does not
+ * exist, so no role's call needs Gotenberg; `packing.e2e.test.ts` renders a real one).
+ *
+ * M38b's station and video routes are asked about sessions, videos and orders that do not
+ * exist: every admitted role gets the same 404, which is what the guard check needs, and
+ * `pack-station.e2e.test.ts` walks the real ones. The settings are saved for real.
+ */
+
+interface Call {
+  readonly url: string;
+  readonly body?: unknown;
+}
+
+const ORG_A = SEED_ORG_IDS['elysium-lifestyle-bd'] ?? '';
+const FIXTURE_USER = 'usr_packing_fixture';
+
+/** A person to own the devices a revocation is tried on; idempotent. */
+export async function preparePackingFixtures(): Promise<void> {
+  await withGlobal(async (tx) => {
+    await tx.execute(sql`
+      insert into iam.users (id, email, name, email_verified)
+      values (${FIXTURE_USER}, 'packing-fixture@example.invalid', 'Packing fixture', true)
+      on conflict (id) do nothing
+    `);
+  });
+}
+
+async function insertDevice(): Promise<string> {
+  return withSystem(
+    async (tx) =>
+      (
+        await tx.execute<{ id: string }>(sql`
+          insert into packing.scanner_devices (org_id, user_id, label, token_sha256, via, expires_at)
+          values (${ORG_A}, ${FIXTURE_USER}, 'Fixture phone',
+                  ${createHash('sha256').update(randomUUID()).digest('hex')}, 'console',
+                  now() + interval '30 days')
+          returning id
+        `)
+      )[0]?.id ?? '',
+    { orgId: ORG_A },
+  );
+}
+
+export const PACKING_ROUTE_FIXTURES: Readonly<Record<string, () => Promise<Call> | Call>> = {
+  'GET /v1/scanner/lookup': () => ({ url: '/v1/scanner/lookup?code=NO-SUCH-PARCEL' }),
+  'GET /v1/scanner/devices': () => ({ url: '/v1/scanner/devices' }),
+  'POST /v1/scanner/devices': () => ({
+    url: '/v1/scanner/devices',
+    body: { deviceName: 'Matrix' },
+  }),
+  'POST /v1/scanner/devices/:id/revoke': async () => ({
+    url: `/v1/scanner/devices/${await insertDevice()}/revoke`,
+  }),
+  'POST /v1/packing/labels': () => ({
+    url: '/v1/packing/labels',
+    body: { orderIds: [randomUUID()], size: 'a4' },
+  }),
+  // M38b: the packing station and the packing video (D-610 to D-615).
+  'POST /v1/packing/sessions': () => ({
+    url: '/v1/packing/sessions',
+    body: { orderId: randomUUID() },
+  }),
+  'GET /v1/packing/sessions': () => ({ url: '/v1/packing/sessions' }),
+  'GET /v1/packing/sessions/:id': () => ({ url: `/v1/packing/sessions/${randomUUID()}` }),
+  'POST /v1/packing/sessions/:id/scans': () => ({
+    url: `/v1/packing/sessions/${randomUUID()}/scans`,
+    body: { scanId: randomUUID(), code: '2000000000015' },
+  }),
+  'POST /v1/packing/sessions/:id/removals': () => ({
+    url: `/v1/packing/sessions/${randomUUID()}/removals`,
+    body: { scanId: randomUUID(), skuId: randomUUID() },
+  }),
+  'POST /v1/packing/sessions/:id/complete': () => ({
+    url: `/v1/packing/sessions/${randomUUID()}/complete`,
+  }),
+  'POST /v1/packing/sessions/:id/videos': () => ({
+    url: `/v1/packing/sessions/${randomUUID()}/videos`,
+    body: { videoId: randomUUID(), startedAt: new Date().toISOString(), mime: 'video/webm' },
+  }),
+  'POST /v1/packing/sessions/:id/videos/:videoId/file': () => ({
+    url: `/v1/packing/sessions/${randomUUID()}/videos/${randomUUID()}/file`,
+    body: { fileId: randomUUID(), durationMs: 1000 },
+  }),
+  'GET /v1/packing/videos/:id/url': () => ({ url: `/v1/packing/videos/${randomUUID()}/url` }),
+  'GET /v1/packing/orders/:orderId': () => ({ url: `/v1/packing/orders/${randomUUID()}` }),
+  'GET /v1/packing/settings': () => ({ url: '/v1/packing/settings' }),
+  'PUT /v1/packing/settings': () => ({
+    url: '/v1/packing/settings',
+    body: { videoEnabled: true },
+  }),
+  // M38c: the IP cameras. Added for real (no password, so no key is needed), each under a
+  // name of its own; a change is asked about a camera that does not exist (404).
+  'GET /v1/packing/cameras': () => ({ url: '/v1/packing/cameras' }),
+  'POST /v1/packing/cameras': () => ({
+    url: '/v1/packing/cameras',
+    body: {
+      name: `Matrix ${randomUUID().slice(0, 8)}`,
+      rtspUrl: 'rtsp://192.0.2.10:554/stream1',
+      enabled: false,
+    },
+  }),
+  'DELETE /v1/packing/cameras/:id': () => ({ url: `/v1/packing/cameras/${randomUUID()}` }),
+  'GET /v1/packing/cameras/:id/preview': () => ({
+    url: `/v1/packing/cameras/${randomUUID()}/preview`,
+  }),
+  'PUT /v1/packing/cameras/:id': () => ({
+    url: `/v1/packing/cameras/${randomUUID()}`,
+    body: { name: 'Matrix', rtspUrl: 'rtsp://192.0.2.10:554/stream1', enabled: false },
+  }),
+  // M46: terminals, printers, the print queue, lots and the handover (D-800 to D-826). A new
+  // terminal and the label settings (no effect since D-917) are written for real; everything
+  // else is asked about a terminal, printer, job, order or session that does not exist (404 for
+  // every admitted role), and a computer with no binding is refused as not bound.
+  'GET /v1/terminals': () => ({ url: '/v1/terminals' }),
+  'POST /v1/terminals': () => ({
+    url: '/v1/terminals',
+    body: { kind: 'label', name: `Matrix ${randomUUID().slice(0, 8)}` },
+  }),
+  'POST /v1/terminals/check-in': () => ({ url: '/v1/terminals/check-in' }),
+  'POST /v1/terminals/devices/:id/revoke': () => ({
+    url: `/v1/terminals/devices/${randomUUID()}/revoke`,
+  }),
+  'PUT /v1/terminals/:id': () => ({
+    url: `/v1/terminals/${randomUUID()}`,
+    body: { name: 'Matrix', locationId: null, active: true },
+  }),
+  'PUT /v1/terminals/:id/members': () => ({
+    url: `/v1/terminals/${randomUUID()}/members`,
+    body: { userIds: [] },
+  }),
+  'PUT /v1/terminals/:id/cameras': () => ({
+    url: `/v1/terminals/${randomUUID()}/cameras`,
+    body: { cameraIds: [] },
+  }),
+  'POST /v1/terminals/:id/bind': () => ({
+    url: `/v1/terminals/${randomUUID()}/bind`,
+    body: { label: 'Matrix computer' },
+  }),
+  'GET /v1/labels/settings': () => ({ url: '/v1/labels/settings' }),
+  'PUT /v1/labels/settings': () => ({
+    url: '/v1/labels/settings',
+    body: { autoPrint: true, autoSlip: false },
+  }),
+  'GET /v1/labels/printers': () => ({ url: '/v1/labels/printers' }),
+  'POST /v1/labels/printers': () => ({
+    url: '/v1/labels/printers',
+    body: {
+      terminalId: randomUUID(),
+      name: 'Matrix',
+      connection: 'browser',
+      language: 'pdf',
+      medium: '4x6',
+      documents: ['label'],
+    },
+  }),
+  'PUT /v1/labels/printers/:id': () => ({
+    url: `/v1/labels/printers/${randomUUID()}`,
+    body: {
+      terminalId: randomUUID(),
+      name: 'Matrix',
+      connection: 'browser',
+      language: 'pdf',
+      medium: '4x6',
+      documents: ['label'],
+      enabled: false,
+    },
+  }),
+  'DELETE /v1/labels/printers/:id': () => ({ url: `/v1/labels/printers/${randomUUID()}` }),
+  'POST /v1/labels/printers/:id/test': () => ({
+    url: `/v1/labels/printers/${randomUUID()}/test`,
+  }),
+  'GET /v1/labels/ready': () => ({ url: '/v1/labels/ready' }),
+  'POST /v1/labels/print': () => ({
+    url: '/v1/labels/print',
+    body: { orderIds: [randomUUID()], documents: ['label'] },
+  }),
+  'GET /v1/labels/jobs': () => ({ url: '/v1/labels/jobs' }),
+  'GET /v1/labels/jobs/export': () => ({ url: '/v1/labels/jobs/export' }),
+  'POST /v1/labels/jobs/not-printed': () => ({
+    url: '/v1/labels/jobs/not-printed',
+    body: { jobIds: [randomUUID()] },
+  }),
+  'POST /v1/labels/jobs/:id/retry': () => ({ url: `/v1/labels/jobs/${randomUUID()}/retry` }),
+  'POST /v1/labels/jobs/:id/cancel': () => ({ url: `/v1/labels/jobs/${randomUUID()}/cancel` }),
+  'GET /v1/labels/orders/:orderId': () => ({ url: `/v1/labels/orders/${randomUUID()}` }),
+  'GET /v1/labels/station/jobs': () => ({ url: '/v1/labels/station/jobs' }),
+  'GET /v1/labels/station/jobs/:id/document': () => ({
+    url: `/v1/labels/station/jobs/${randomUUID()}/document`,
+  }),
+  'POST /v1/labels/station/jobs/:id/result': () => ({
+    url: `/v1/labels/station/jobs/${randomUUID()}/result`,
+    body: { result: 'printed' },
+  }),
+  'PUT /v1/packing/orders/:orderId/lots': () => ({
+    url: `/v1/packing/orders/${randomUUID()}/lots`,
+    body: { count: 2 },
+  }),
+  // M51: the return station, asked about orders and returns that do not exist (D-934).
+  'POST /v1/packing/returns': () => ({
+    url: '/v1/packing/returns',
+    body: { orderId: randomUUID() },
+  }),
+  'GET /v1/packing/returns': () => ({ url: '/v1/packing/returns' }),
+  'GET /v1/packing/returns/orders/:orderId': () => ({
+    url: `/v1/packing/returns/orders/${randomUUID()}`,
+  }),
+  'GET /v1/packing/returns/:id': () => ({ url: `/v1/packing/returns/${randomUUID()}` }),
+  'POST /v1/packing/returns/:id/scans': () => ({
+    url: `/v1/packing/returns/${randomUUID()}/scans`,
+    body: { scanId: randomUUID(), code: '2000000000015' },
+  }),
+  'POST /v1/packing/returns/:id/removals': () => ({
+    url: `/v1/packing/returns/${randomUUID()}/removals`,
+    body: { scanId: randomUUID(), skuId: randomUUID() },
+  }),
+  // D-1027: a bag and a piece by hand, on a return that does not exist.
+  'POST /v1/packing/returns/:id/bag': () => ({
+    url: `/v1/packing/returns/${randomUUID()}/bag`,
+    body: { scanId: randomUUID(), action: 'open' },
+  }),
+  'POST /v1/packing/returns/:id/additions': () => ({
+    url: `/v1/packing/returns/${randomUUID()}/additions`,
+    body: { scanId: randomUUID(), skuId: randomUUID() },
+  }),
+  'POST /v1/packing/returns/:id/receive': () => ({
+    url: `/v1/packing/returns/${randomUUID()}/receive`,
+    body: { returnReason: 'customer_refused', reason: 'Matrix' },
+  }),
+  'POST /v1/packing/sessions/:id/lots/close': () => ({
+    url: `/v1/packing/sessions/${randomUUID()}/lots/close`,
+  }),
+  'GET /v1/packing/handover': () => ({ url: '/v1/packing/handover' }),
+  'POST /v1/packing/handover/scans': () => ({
+    url: '/v1/packing/handover/scans',
+    body: { code: 'NO-SUCH-PARCEL' },
+  }),
+  'POST /v1/packing/handover': () => ({
+    url: '/v1/packing/handover',
+    body: { orderIds: [randomUUID()] },
+  }),
+};

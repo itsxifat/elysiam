@@ -1,0 +1,177 @@
+packages:
+  - 'apps/*'
+  - 'packages/*'
+
+# Every third-party version is pinned exactly, in one place. Packages reference
+# them as "catalog:" so a bump is a single-line change that cannot drift between
+# workspace members.
+# pnpm asks about packages with install scripts. esbuild's postinstall places
+# its platform binary, which tsx and the Vite config loader need, so it is
+# allowed. Leaving this unanswered makes `pnpm install` exit 1 on a fresh
+# clone and in CI.
+allowBuilds:
+  esbuild: true
+  # Transitive dependencies of testcontainers, via dockerode -> ssh2. All three
+  # build scripts compile optional native addons that only speed up SSH
+  # transport and protobuf decoding; testcontainers talks to Docker over a local
+  # socket and works without them. Declining keeps a C++ toolchain off every
+  # developer machine and out of CI.
+  cpu-features: false
+  protobufjs: false
+  ssh2: false
+
+# @nestjs/platform-fastify pulls its own fastify, so two copies resolved. Their
+# FastifyInstance types are structurally distinct, which made the
+# @fastify/cookie augmentation invisible on the instance Nest hands back — and
+# would have meant two plugin registries and two route tables at runtime.
+overrides:
+  fastify: 5.12.5
+
+catalog:
+  # --- language and build -------------------------------------------------
+  # TypeScript is pinned to 6.0.3, NOT 7.x, on purpose (D-039). TypeScript 7 is
+  # the native port and has removed the classic JS compiler API
+  # (createProgram / SyntaxKind / sys are all undefined), which typescript-eslint
+  # needs for type-aware linting. Revisit when typescript-eslint supports 7.x.
+  typescript: 6.0.3
+  turbo: 2.11.2
+  '@types/node': 24.13.6
+  tsx: 4.23.15
+  concurrently: 10.0.5
+
+  # --- lint and format ----------------------------------------------------
+  eslint: 10.11.0
+  '@eslint/js': 10.0.1
+  typescript-eslint: 8.70.0
+  eslint-config-prettier: 10.1.8
+  eslint-plugin-react-hooks: 7.1.1
+  globals: 17.12.0
+  prettier: 3.9.8
+  prettier-plugin-tailwindcss: 0.8.1
+
+  # --- test ---------------------------------------------------------------
+  vitest: 5.0.1
+  '@vitest/coverage-v8': 5.0.1
+  '@playwright/test': 1.63.0
+  happy-dom: 20.14.5
+
+  # --- server -------------------------------------------------------------
+  '@nestjs/common': 12.0.3
+  '@nestjs/core': 12.0.3
+  '@nestjs/platform-fastify': 12.0.3
+  '@nestjs/testing': 12.0.3
+  fastify: 5.12.5
+  reflect-metadata: 0.2.2
+  rxjs: 7.8.2
+  pino: 10.3.1
+  pino-pretty: 13.1.3
+  pg-boss: 12.33.2
+  # M34 (D-522, D-529). bcryptjs: the website's shoppers' passwords, bcrypt because the old
+  # site's hashes are bcrypt and must keep working; pure JS, so no native build on any host.
+  # nodemailer: the website's emails over the brand's own SMTP server, the old site's mailer.
+  bcryptjs: 3.0.3
+  nodemailer: 10.0.12
+  # M35b (D-555). uqr: the QR code on the order labels, a small zero-dependency encoder that
+  # draws an SVG the label's HTML embeds for Gotenberg.
+  uqr: 0.1.3
+  # sharp for §22's image variants. It is the only Node image library that
+  # re-encodes through libvips rather than shelling out, and re-encoding is
+  # what strips the EXIF GPS tags a customer photo carries (invariant 10).
+  sharp: 0.35.4
+
+  # --- observability (§26, M14b) ----------------------------------------------
+  # Each is loaded only by `apps/server/src/instrument.ts`, and only when its DSN or
+  # endpoint is configured; with neither, no test and no process imports them.
+  #   - @sentry/node: server error reporting, errors only (no Sentry tracing, D-344).
+  #   - @opentelemetry/sdk-node: the documented NodeSDK; it builds the OTLP exporters
+  #     from the standard OTEL_* variables, so no exporter package is imported directly.
+  #   - @opentelemetry/api: the SDK's peer, which must resolve from the server.
+  #   - @opentelemetry/instrumentation-http / -undici: incoming requests, and the
+  #     outbound courier, SMS and Meta calls (Node's fetch is undici).
+  '@sentry/node': 11.2.0
+  '@opentelemetry/sdk-node': 0.222.0
+  '@opentelemetry/api': 1.9.1
+  '@opentelemetry/instrumentation-http': 0.222.0
+  '@opentelemetry/instrumentation-undici': 0.32.0
+
+  # --- realtime (§19) -----------------------------------------------------
+  # socket.io for the /rt gateway, its redis adapter so several API instances
+  # fan one event out to every socket, and ioredis as that adapter's client.
+  # ioredis rather than iovalkey: Valkey speaks RESP, ioredis is the client the
+  # adapter is tested against, and iovalkey is a 0.x fork of it.
+  'socket.io': 4.8.3
+  'socket.io-client': 4.8.3
+  '@socket.io/redis-adapter': 8.3.0
+  ioredis: 5.11.1
+
+  # --- data ---------------------------------------------------------------
+  drizzle-orm: 0.45.2
+  '@better-auth/utils': 0.4.2
+  better-auth: 1.7.5
+  '@fastify/cookie': 11.1.2
+  '@fastify/cors': 11.3.0
+  '@testcontainers/postgresql': 12.1.0
+  fast-check: 4.10.2
+  drizzle-kit: 0.31.10
+  postgres: 3.4.9
+  zod: 4.6.5
+  '@casl/ability': 7.0.1
+
+  # --- frontend -----------------------------------------------------------
+  react: 19.3.0
+  react-dom: 19.3.0
+  '@types/react': 19.3.0
+  '@types/react-dom': 19.3.0
+  vite: 8.3.0
+  '@vitejs/plugin-react': 6.1.1
+  tailwindcss: 4.3.3
+  '@tailwindcss/vite': 4.3.3
+  '@tailwindcss/postcss': 4.3.3
+  next: 16.3.5
+  lucide-react: 1.47.0
+  react-hook-form: 7.66.1
+  '@hookform/resolvers': 5.2.2
+  clsx: 2.1.1
+  tailwind-merge: 3.7.0
+  class-variance-authority: 0.7.1
+
+  # M05's kit. Each is here because the alternative is worse, not because it is
+  # popular:
+  #   - TanStack Router: file routes with typed params, so a link to a screen
+  #     that does not exist is a compile error rather than a 404 in production.
+  #   - TanStack Query: server state with cache invalidation, which every module
+  #     screen needs and which hand-rolled `useEffect` fetching gets wrong in the
+  #     same three ways every time.
+  #   - TanStack Table: headless, so the DataTable renders through our tokens
+  #     rather than a library's stylesheet (D-033).
+  #   - Radix primitives: unstyled and accessible. Keyboard behaviour, focus
+  #     trapping and ARIA wiring are what M05's checks 6 and 7 are about, and
+  #     writing them by hand is how they end up half-right.
+  #   - cmdk: the command palette, built on the same Radix dialog.
+  #   - @axe-core/playwright: check 6 asks for an axe scan with zero serious or
+  #     critical violations; this is how it is measured rather than asserted.
+  '@tanstack/react-router': 1.170.39
+  '@tanstack/react-query': 5.103.2
+  '@tanstack/react-table': 9.2.4
+  '@radix-ui/react-dialog': 1.1.23
+  '@radix-ui/react-dropdown-menu': 2.1.24
+  '@radix-ui/react-select': 2.3.7
+  '@radix-ui/react-popover': 1.1.23
+  '@radix-ui/react-tooltip': 1.2.16
+  '@radix-ui/react-label': 2.1.15
+  '@radix-ui/react-checkbox': 1.3.11
+  cmdk: 1.1.1
+  '@axe-core/playwright': 4.13.0
+  # Component tests render into happy-dom and assert what a user would see —
+  # a label, a word, a time — rather than a class name. Querying by role and
+  # accessible name is also how the accessibility floor gets tested by default
+  # instead of as a separate pass.
+  '@testing-library/react': 16.3.3
+
+  # --- extension ----------------------------------------------------------
+  wxt: 0.21.4
+  '@wxt-dev/module-react': 1.2.2
+
+minimumReleaseAgeExclude:
+  - fast-check@4.10.2
+  - tsx@4.23.15

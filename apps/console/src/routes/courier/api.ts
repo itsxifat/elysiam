@@ -1,0 +1,542 @@
+import { api, ApiError } from '../../api.js';
+import { env } from '../../env.js';
+
+/**
+ * `/v1/courier/*`, typed to what the controller returns (M12, M15).
+ *
+ * Hand-written against the controller, for the reason every other section gives: M04's
+ * generated client types each response as `unknown`, and an `unknown` gets cast somewhere —
+ * a cast in a page component is a type nobody maintains.
+ *
+ * **Every amount is a string and stays one.** §23 sends integer poisha as a decimal string,
+ * because `JSON.parse` turns a crore-scale total into a double and silently drops its last
+ * digits; `<Money>` takes the string. Counts and basis points are small integers and are
+ * numbers.
+ *
+ * **No recipient data in any of these types.** The courier screens show order numbers,
+ * consignment numbers and amounts; the recipient's phone and address are the order desk's
+ * and the label's business, and a list that carried them would be one more place a phone
+ * number sits in a browser's memory for no reason (invariant 10).
+ */
+
+export type ParcelStatus =
+  | 'booked'
+  | 'pickup_pending'
+  | 'picked_up'
+  | 'in_transit'
+  | 'out_for_delivery'
+  | 'hold'
+  | 'delivered'
+  | 'partial_delivered'
+  | 'return_in_transit'
+  | 'returned_to_merchant'
+  | 'cancelled'
+  | 'unknown';
+
+export type BookingState = 'pending' | 'booked' | 'failed' | 'cancelled';
+
+export interface ParcelRow {
+  readonly id: string;
+  readonly orderId: string;
+  readonly orderNo: string;
+  readonly courierId: string;
+  readonly courierName: string;
+  readonly branchId: string | null;
+  readonly consignmentNo: string | null;
+  readonly trackingCode: string | null;
+  readonly bookingState: BookingState;
+  readonly status: ParcelStatus;
+  readonly rawStatus: string | null;
+  readonly codAmountPoisha: string;
+  readonly collectedPoisha: string | null;
+  readonly bookedAt: string | null;
+  readonly statusChangedAt: string | null;
+  readonly hasReturnReceipt: boolean;
+  /** Why a failed booking failed, in the adapter's words; null otherwise. */
+  readonly bookingFailureMessage: string | null;
+}
+
+export type StuckReason =
+  | 'no_status_change'
+  | 'unknown_status'
+  | 'booking_failed'
+  | 'unposted_delivery'
+  | 'return_not_received'
+  /** D-903: handed over, and the courier has not said it has the parcel in time. */
+  | 'not_received';
+
+export interface StuckParcel {
+  readonly consignmentId: string;
+  readonly orderId: string;
+  readonly orderNo: string;
+  readonly courierId: string;
+  readonly courierName: string;
+  readonly consignmentNo: string | null;
+  readonly trackingCode: string | null;
+  readonly status: ParcelStatus;
+  readonly rawStatus: string | null;
+  readonly lastEventRawStatus: string | null;
+  readonly bookingState: BookingState;
+  readonly bookingFailureCode: string | null;
+  readonly codAmountPoisha: string;
+  readonly statusSince: string;
+  readonly daysStuck: number;
+  readonly reasons: readonly StuckReason[];
+  readonly escalationCount: number;
+  readonly lastEscalationNote: string | null;
+}
+
+export interface PerformanceRow {
+  readonly courierId: string;
+  readonly courierName: string;
+  readonly deliveryZoneId: string | null;
+  readonly booked: number;
+  readonly delivered: number;
+  readonly partial: number;
+  readonly returned: number;
+  readonly cancelled: number;
+  readonly inFlight: number;
+  readonly resolved: number;
+  readonly deliveryRateBps: number | null;
+  readonly returnRateBps: number | null;
+  readonly averageDeliveryDays: string | null;
+}
+
+export type SettlementStatus = 'imported' | 'pending_approval' | 'posted' | 'rejected';
+export type SettlementMatch =
+  'matched' | 'unmatched' | 'amount_mismatch' | 'duplicate' | 'already_settled';
+
+export interface SettlementRow {
+  readonly id: string;
+  readonly courierId: string;
+  readonly reference: string | null;
+  readonly settlementDate: string;
+  readonly postingBusinessDate: string | null;
+  readonly deferredFromClosedPeriod: boolean;
+  readonly status: SettlementStatus;
+  readonly source: 'upload' | 'api';
+  readonly fileRowCount: number;
+  readonly matchedGrossPoisha: string;
+  readonly matchedChargesPoisha: string;
+  readonly matchedNetPoisha: string;
+  readonly matchedRowCount: number;
+  readonly exceptionCount: number;
+  readonly approvalRequestId: string | null;
+  readonly rejectedReason: string | null;
+}
+
+export interface SettlementLine {
+  readonly id: string;
+  readonly rowNo: number;
+  readonly consignmentNo: string;
+  readonly reference: string | null;
+  readonly match: SettlementMatch;
+  readonly codCollectedPoisha: string;
+  readonly netPoisha: string;
+  readonly expectedPoisha: string | null;
+  readonly note: string | null;
+}
+
+export interface FetchRun {
+  readonly id: string;
+  readonly courierAccountId: string;
+  readonly startedAt: string;
+  readonly seen: number;
+  readonly created: number;
+  readonly duplicate: number;
+  readonly refused: number;
+  readonly error: string | null;
+}
+
+export interface CourierAccount {
+  readonly id: string;
+  readonly courierId: string;
+  readonly label: string;
+  readonly providerCode: string;
+  readonly isActive: boolean;
+  readonly verified: boolean;
+  /** The rest of the account view: never a credential, only whether one is set (§21). */
+  readonly courierCode?: string | null;
+  readonly mode?: 'sandbox' | 'live';
+  readonly baseUrl?: string | null;
+  readonly hasCredentials?: boolean;
+  readonly credentialsFingerprint?: string | null;
+  readonly hasWebhookSecret?: boolean;
+  readonly supportsWebhook?: boolean;
+  readonly pollAfterHours?: number;
+  readonly settlementWalletId?: string | null;
+  readonly webhookPath?: string | null;
+  /** The courier's name, as Settings → Couriers shows it (D-913). */
+  readonly name?: string;
+  /** Whether this is the brand's one default courier (D-913). */
+  readonly isDefault?: boolean;
+  /** When the courier's webhook last reached this account (D-918); null before the first. */
+  readonly lastWebhookAt?: string | null;
+  /** Whether "Check connection" can ask the courier for its balance (D-918). */
+  readonly reportsBalance?: boolean;
+}
+
+/**
+ * An adapter an account can use, and the credential field names it needs (D-395).
+ *
+ * `connect` (D-913): `api` books through the courier's API with the keys typed here; `panel`
+ * is a courier with no API connection (Carrybee), whose parcels are booked in its own merchant
+ * panel, so it asks for no keys.
+ */
+export interface CourierProvider {
+  readonly code: string;
+  readonly verified: boolean;
+  readonly enabled: boolean;
+  readonly supportsWebhook: boolean;
+  readonly credentialFields: readonly string[];
+  readonly name?: string;
+  readonly connect?: 'api' | 'panel';
+}
+
+/** `POST /v1/courier/connections`: choose the courier, type its keys, default or not (D-913). */
+export interface ConnectCourierInput {
+  readonly provider: string;
+  /** Write-only: sent once, sealed by the server, never returned. */
+  readonly credentials: Readonly<Record<string, string>>;
+  readonly isDefault: boolean;
+}
+
+export interface CourierConnection {
+  readonly courierId: string;
+  /** Null for a courier booked in its own panel: it has no API account. */
+  readonly accountId: string | null;
+  readonly connected: boolean;
+  readonly isDefault: boolean;
+  readonly message: string;
+}
+
+export interface ParcelTimeline {
+  readonly consignment: {
+    readonly id: string;
+    readonly orderId: string;
+    readonly orderNo: string;
+    readonly courierId: string;
+    readonly consignmentNo: string | null;
+    readonly trackingCode: string | null;
+    readonly bookingState: BookingState;
+    readonly bookingFailureCode: string | null;
+    readonly status: ParcelStatus;
+    readonly rawStatus: string | null;
+    readonly codAmountPoisha: string;
+    readonly collectedPoisha: string | null;
+    readonly bookedAt: string | null;
+    readonly deliveredAt: string | null;
+    readonly returnedAt: string | null;
+    readonly settlementId: string | null;
+    readonly statusChangedAt: string | null;
+    readonly isFinal: boolean;
+    /** When a person confirmed a rider took it, or null (M12; D-391 ships the order). */
+    readonly handoverConfirmedAt?: string | null;
+  };
+  readonly events: readonly {
+    readonly id: string;
+    readonly source: 'webhook' | 'poll' | 'manual';
+    readonly status: ParcelStatus;
+    readonly rawStatus: string;
+    readonly occurredAt: string;
+    readonly orderToStatus: string | null;
+  }[];
+  readonly escalations: readonly {
+    readonly id: string;
+    readonly note: string;
+    readonly createdAt: string;
+  }[];
+}
+
+export interface Location {
+  readonly id: string;
+  readonly code: string;
+  readonly name: string;
+  readonly kind: string;
+  readonly isActive: boolean;
+}
+
+function query(params: Record<string, string | number | undefined>): string {
+  const search = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) {
+    if (value === undefined || value === '') continue;
+    search.set(key, String(value));
+  }
+  const text = search.toString();
+  return text === '' ? '' : `?${text}`;
+}
+
+export function listParcels(filter: {
+  q?: string | undefined;
+  status?: string | undefined;
+  courierId?: string | undefined;
+  awaitingReturn?: boolean;
+  page: number;
+  pageSize: number;
+}): Promise<{ items: readonly ParcelRow[] }> {
+  return api.get(
+    `/v1/courier/parcels${query({
+      q: filter.q,
+      status: filter.status,
+      courierId: filter.courierId,
+      awaitingReturn:
+        filter.awaitingReturn === undefined ? undefined : String(filter.awaitingReturn),
+      page: filter.page,
+      pageSize: filter.pageSize,
+    })}`,
+  );
+}
+
+/** One order's parcels, for the order detail (D-392). */
+export function parcelsForOrder(orderId: string): Promise<{ items: readonly ParcelRow[] }> {
+  return api.get(`/v1/courier/parcels${query({ orderId, pageSize: 10 })}`);
+}
+
+/** Queue a booking with the order's courier (§9's `manual` policy). */
+export function bookParcel(
+  orderId: string,
+): Promise<{ consignmentId: string | null; enqueued: boolean }> {
+  return api.post('/v1/courier/parcels', { orderId });
+}
+
+/** D-1024: book these orders again after a failed booking (M15's bulk booking, one by one). */
+export function bookParcels(orderIds: readonly string[]): Promise<{
+  results: readonly { orderId: string; enqueued: boolean; code: string | null }[];
+}> {
+  return api.post('/v1/courier/parcels/bulk', { orderIds });
+}
+
+/** D-1026: a failed booking given the parcel the courier already holds (its consignment id). */
+export function linkConsignment(
+  consignmentId: string,
+  consignmentNo: string,
+): Promise<{ consignmentId: string; consignmentNo: string }> {
+  return api.post(`/v1/courier/parcels/${consignmentId}/consignment`, {
+    consignmentNo: consignmentNo.trim(),
+  });
+}
+
+/** A rider signed for the parcel; ships the order if it is still waiting to ship (D-391). */
+export function confirmHandover(
+  consignmentId: string,
+  note?: string,
+): Promise<{ consignmentId: string; handoverConfirmedAt: string; orderTo: string | null }> {
+  return api.post(
+    `/v1/courier/parcels/${consignmentId}/handover`,
+    note === undefined || note.trim() === '' ? {} : { note: note.trim() },
+  );
+}
+
+/**
+ * §9's manual fallback on a parcel: a status the courier has not reported yet. A delivery
+ * recorded here writes the parcel's collection as well as the order's journals, which is
+ * why the order detail sends a parcel's delivery this way (ledger audit of D-392, W2).
+ */
+export function setParcelStatus(
+  consignmentId: string,
+  input: {
+    readonly status: ParcelStatus;
+    readonly rawStatus: string;
+    readonly reason: string;
+    readonly collectedPoisha?: string;
+    /** Why the collection differs from the COD: it goes on the Sales discounts line (§7). */
+    readonly differenceReason?: string;
+    readonly deliveredLines?: readonly { readonly skuId: string; readonly deliveredQty: number }[];
+  },
+): Promise<{ recorded: boolean; transitioned: boolean; orderTo: string | null }> {
+  return api.post(`/v1/courier/parcels/${consignmentId}/status`, input);
+}
+
+export function courierProviders(): Promise<{ items: readonly CourierProvider[] }> {
+  return api.get('/v1/courier/providers');
+}
+
+export interface UpsertCourierAccountInput {
+  readonly courierId: string;
+  readonly providerCode: string;
+  readonly label: string;
+  readonly mode: 'sandbox' | 'live';
+  readonly baseUrl?: string;
+  /** Sent only when typed: an empty field keeps the stored key (accounts.service). */
+  readonly credentials?: Record<string, string>;
+  readonly webhookSecret?: string;
+  readonly pollAfterHours: number;
+  readonly settlementWalletId?: string;
+  readonly isActive: boolean;
+}
+
+export function saveCourierAccount(input: UpsertCourierAccountInput): Promise<CourierAccount> {
+  return api.post('/v1/courier/accounts', input);
+}
+
+/**
+ * Connect a courier in one step (D-913): the server checks the keys with the courier first and
+ * saves nothing when they are wrong (a 400 whose message says why, in plain words).
+ */
+export function connectCourier(input: ConnectCourierInput): Promise<CourierConnection> {
+  return api.post('/v1/courier/connections', input);
+}
+
+/** What the courier holds for the brand, which also proves the saved keys work (D-918). */
+export function courierBalance(
+  accountId: string,
+): Promise<{ readonly balancePoisha: string; readonly checkedAt: string }> {
+  return api.get(`/v1/courier/accounts/${accountId}/balance`);
+}
+
+/** The full address a courier's webhook is sent to: the API's host and the account's path. */
+export function webhookUrl(path: string): string {
+  return new URL(path, env.VITE_API_URL).href;
+}
+
+export type DeliveryRisk = 'new' | 'good' | 'caution' | 'risky';
+
+/**
+ * A buyer's delivery record with the brand's courier (D-918): Steadfast's own fraud check,
+ * counts across every shop it delivers for. Counts and percentages, no recipient data.
+ */
+export interface DeliveryRecordAnswer {
+  readonly available: boolean;
+  /** `limited`: the hour's budget of courier calls is spent (D-918); `message` says when. */
+  readonly reason: 'no_courier' | 'unavailable' | 'limited' | null;
+  readonly courier: { readonly code: string; readonly name: string } | null;
+  readonly record: {
+    readonly delivered: number;
+    readonly cancelled: number;
+    readonly parcels: number;
+    readonly successPercent: number | null;
+    readonly reports: number;
+    readonly reportReasons: readonly { readonly code: string; readonly count: number }[];
+    readonly volumeBand: string | null;
+    readonly volumeRange: string | null;
+    readonly doubtfulReports: boolean;
+    readonly courierLevel: string | null;
+  } | null;
+  readonly risk: DeliveryRisk | null;
+  readonly checkedAt: string | null;
+  readonly message: string | null;
+}
+
+export function deliveryRecord(phone: string): Promise<DeliveryRecordAnswer> {
+  return api.get(`/v1/courier/delivery-record?phone=${encodeURIComponent(phone)}`);
+}
+
+export function parcelTimeline(consignmentId: string): Promise<ParcelTimeline> {
+  return api.get(`/v1/courier/parcels/${consignmentId}`);
+}
+
+export function listAccounts(): Promise<{
+  items: readonly CourierAccount[];
+  /**
+   * The brand's default courier as the delivery zones have it (D-913): null when they name
+   * different couriers or none. An older server leaves it out; then it is read off `isDefault`.
+   */
+  defaultCourierId?: string | null;
+  /** Its name, also for a courier with no account (the brand's own rider). */
+  defaultCourierName?: string | null;
+  /** The active zones name different couriers: making one the default replaces them all. */
+  zonesMixed?: boolean;
+}> {
+  return api.get('/v1/courier/accounts');
+}
+
+export function stuckParcels(input: {
+  thresholdDays: number;
+  courierId?: string | undefined;
+}): Promise<{ thresholdDays: number; cutoffDate: string; items: readonly StuckParcel[] }> {
+  return api.get(`/v1/courier/stuck${query(input)}`);
+}
+
+export function repoll(
+  consignmentIds: readonly string[],
+): Promise<{ queued: number; skipped: number }> {
+  return api.post('/v1/courier/stuck/repoll', { consignmentIds });
+}
+
+export function escalate(consignmentId: string, note: string): Promise<{ id: string }> {
+  return api.post(`/v1/courier/parcels/${consignmentId}/escalations`, { note });
+}
+
+export function performance(input: {
+  from?: string | undefined;
+  to?: string | undefined;
+  courierId?: string | undefined;
+}): Promise<{
+  from: string;
+  to: string;
+  rows: readonly PerformanceRow[];
+  couriers: readonly PerformanceRow[];
+}> {
+  return api.get(`/v1/courier/reports/performance${query(input)}`);
+}
+
+export function listSettlements(): Promise<{ items: readonly SettlementRow[] }> {
+  return api.get('/v1/courier/settlements');
+}
+
+export function getSettlement(
+  settlementId: string,
+): Promise<SettlementRow & { lines: readonly SettlementLine[] }> {
+  return api.get(`/v1/courier/settlements/${settlementId}`);
+}
+
+export function requestSettlementApproval(
+  settlementId: string,
+): Promise<{ approvalRequestId: string; status: string }> {
+  return api.post(`/v1/courier/settlements/${settlementId}/approval`, {});
+}
+
+export function rejectSettlement(settlementId: string, reason: string): Promise<unknown> {
+  return api.post(`/v1/courier/settlements/${settlementId}/reject`, { reason });
+}
+
+export function fetchSettlements(courierId: string): Promise<{ queued: boolean }> {
+  return api.post('/v1/courier/settlements/fetch', { courierId });
+}
+
+export function fetchRuns(): Promise<{ items: readonly FetchRun[] }> {
+  return api.get('/v1/courier/settlements/fetch-runs');
+}
+
+export function listLocations(): Promise<{ items: readonly Location[] }> {
+  return api.get('/v1/inventory/locations');
+}
+
+/** Zones and courier names, from the orders module's own list (M10). */
+export function deliveryZones(): Promise<{
+  zones: readonly { id: string; code: string; nameEn: string; nameBn: string }[];
+  couriers: readonly { id: string; code: string; name: string }[];
+}> {
+  return api.get('/v1/delivery-zones');
+}
+
+/**
+ * A file from the API — the label PDF or the stuck-parcel CSV — as a blob URL to open.
+ *
+ * The shared client parses JSON, so bytes are fetched here, with the session cookie. A `GET`,
+ * so no CSRF header is needed. The caller revokes the URL when it is done with it.
+ */
+export async function fileUrl(path: string): Promise<string> {
+  const response = await fetch(new URL(path, env.VITE_API_URL), { credentials: 'include' });
+  if (!response.ok) {
+    let code: string | null = null;
+    let message = response.statusText;
+    try {
+      const problem = (await response.json()) as { code?: unknown; detail?: unknown };
+      if (typeof problem.code === 'string') code = problem.code;
+      if (typeof problem.detail === 'string') message = problem.detail;
+    } catch {
+      // Not a problem document; the status text stands.
+    }
+    throw new ApiError(response.status, code, message);
+  }
+  return URL.createObjectURL(await response.blob());
+}
+
+export function labelsPath(consignmentIds: readonly string[]): string {
+  return `/v1/courier/labels?ids=${consignmentIds.join(',')}`;
+}
+
+export function stuckExportPath(thresholdDays: number, courierId?: string): string {
+  return `/v1/courier/stuck/export${query({ thresholdDays, courierId })}`;
+}

@@ -1,0 +1,1450 @@
+import { Inject, Injectable, Logger } from '@nestjs/common';
+import {
+  defineAbilityFor,
+  type LabelSettingsInput,
+  type PrintJobsQuery,
+  type PrintRequestInput,
+  type ReadyForLabelQuery,
+  type StationResultInput,
+} from '@elysium/contracts';
+import { withGlobal, withOrg, type Tx } from '@elysium/db';
+import {
+  PRINT_MAX_ATTEMPTS,
+  PRINT_SENDING_STALE_MS,
+  isReprint,
+  pickTerminal,
+  printSummary,
+  printerOnline,
+  printerShownState,
+  lotContents,
+  piecesByLot,
+} from '@elysium/domain/packing';
+import { sql } from 'drizzle-orm';
+
+import { AuditService } from '../../platform/audit/audit.service.js';
+import type { AuditableRequest } from '../../platform/audit/audit.interceptor.js';
+import { open as openSealed } from '../../platform/crypto/sealed-box.js';
+import { emit } from '../../platform/events/outbox.js';
+import type { ActiveContext } from '../../platform/http/context.js';
+import { enqueue } from '../../platform/jobs/enqueue.js';
+import { GotenbergClient } from '../files/pdf/gotenberg.client.js';
+import { IAM_API, type IamApi } from '../iam/iam.api.js';
+import { ORDERS_API, type OrdersApi } from '../orders/orders.api.js';
+import * as repo from './labels.repository.js';
+import * as rec from './recording.repository.js';
+import * as station from './station.repository.js';
+import { PACKING_QUEUES, type SendPrintPayload } from './packing.queues.js';
+import { destinationRefusal } from './printers/destination.js';
+import {
+  ippGetPrinterAttributes,
+  ippPrintJob,
+  ippPrinterState,
+  ippSucceeded,
+  parseIppResponse,
+} from './printers/ipp.js';
+import {
+  renderForPrinter,
+  renderPictureForBrowser,
+  testPage,
+  type PrintPage,
+} from './printers/render.js';
+import { PRINTER_TRANSPORT, PrinterIoError, type PrinterTransport } from './printers/transport.js';
+import { printerPasswordBinding } from './printers.service.js';
+import { mapPackingErrors, PackingError } from './station.errors.js';
+import { TerminalsService } from './terminals.service.js';
+
+const iso = (value: Date | string | null): string | null =>
+  value === null ? null : new Date(value).toISOString();
+
+const at = (value: Date | string | null): Date | null => (value === null ? null : new Date(value));
+
+/** The order statuses a label or slip is printed at: still at the hub. */
+const PRINTABLE_STATUSES: readonly string[] = ['confirmed', 'packed'];
+
+type PrintedDocument = 'label' | 'packing_slip';
+
+/** A refusal a person can act on, never a printer's raw reply. */
+class PrintFailure extends Error {
+  constructor(
+    message: string,
+    /** Retrying cannot help (the address is refused, the document is gone). */
+    readonly final: boolean,
+  ) {
+    super(message);
+    this.name = 'PrintFailure';
+  }
+}
+
+/** The paper an order's slip is drawn on for a printer: A4 on A4 paper, otherwise A5. */
+function slipPaperFor(printer: repo.PrinterRow): 'a4' | 'a5' {
+  return printer.width_um >= 200_000 ? 'a4' : 'a5';
+}
+
+/** A short CSV cell: quoted, and never read as a formula by a spreadsheet. */
+function csvCell(value: string | number | null): string {
+  if (value === null) return '';
+  const text = String(value);
+  const safe = /^[=+\-@\t\r]/.test(text) ? `'${text}` : text;
+  return /[",\n\r]/.test(safe) ? `"${safe.replace(/"/g, '""')}"` : safe;
+}
+
+/**
+ * The print queue (M46, D-813 to D-819): what is printed, where, by whom and why, and the log
+ * of every print.
+ *
+ * A print is a row first (`packing.print_jobs`), written in the transaction that asks for it,
+ * with its delivery queued in that same transaction: a pg-boss `labels.send` for a network
+ * printer (the worker renders and sends it, no transaction open, invariant 6), or a
+ * `labels.job_changed` event for a browser print station, which fetches and prints it and says
+ * how it went. Every print is asked for by a person (D-917): nothing prints by itself, and the
+ * orders ready for their label wait in "Ready for label" until someone prints them, one or many
+ * at once. The log is the rows: nothing about a print is written anywhere else.
+ */
+@Injectable()
+export class PrintingService {
+  private readonly logger = new Logger(PrintingService.name);
+
+  constructor(
+    @Inject(ORDERS_API) private readonly orders: OrdersApi,
+    @Inject(IAM_API) private readonly iam: IamApi,
+    @Inject(PRINTER_TRANSPORT) private readonly transport: PrinterTransport,
+    private readonly gotenberg: GotenbergClient,
+    private readonly terminals: TerminalsService,
+    private readonly audit: AuditService,
+  ) {}
+
+  // --- the brand's settings (D-817; automatic printing retired, D-917) ----------------------
+
+  /**
+   * D-917: automatic printing is retired, so `autoPrint` and `autoSlip` always answer false and
+   * the saved switch has no effect. The route and its fields stay for the clients that still
+   * read and write them; `autoPrintSetting` is what was saved, for the record.
+   */
+  async settings(context: ActiveContext) {
+    return withOrg({ orgId: context.orgId, userId: context.userId }, async (tx) => {
+      const [row, printers, courierBooking] = await Promise.all([
+        repo.labelSettingsOf(tx, context.orgId),
+        repo.printersOf(tx, context.orgId),
+        this.orders.courierBooking(tx, context.orgId),
+      ]);
+      const live = printers.filter((printer) => printer.enabled).length;
+      return {
+        autoPrint: false,
+        /** The saved switch, or null when never saved. No effect since D-917. */
+        autoPrintSetting: row?.auto_print ?? null,
+        autoSlip: false,
+        printers: live,
+        /** When the courier is booked (D-908); a label is printed by a person either way (D-917). */
+        courierBooking,
+        canEdit: defineAbilityFor(context).can('update', 'PackingTerminal'),
+        updatedAt: row === undefined ? null : iso(row.updated_at),
+      };
+    });
+  }
+
+  /**
+   * Saved and audited as before, for compatibility, but it changes nothing (D-917): nothing
+   * prints by itself, so the answer is false whatever was saved, as `settings` says.
+   */
+  async saveSettings(context: ActiveContext, request: AuditableRequest, input: LabelSettingsInput) {
+    return withOrg({ orgId: context.orgId, userId: context.userId }, async (tx) => {
+      const before = await repo.labelSettingsOf(tx, context.orgId);
+      const row = await repo.saveLabelSettings(tx, {
+        orgId: context.orgId,
+        autoPrint: input.autoPrint,
+        autoSlip: input.autoSlip,
+        userId: context.userId,
+      });
+      await this.audit.record(tx, {
+        orgId: context.orgId,
+        actorUserId: context.userId,
+        operation: 'update',
+        action: 'labels.settings_saved',
+        entityType: 'label_settings',
+        entityId: context.orgId,
+        before: { autoPrint: before?.auto_print ?? null, autoSlip: before?.auto_slip ?? false },
+        after: { autoPrint: row.auto_print, autoSlip: row.auto_slip },
+        request,
+      });
+      return {
+        autoPrint: false,
+        autoSlip: false,
+        updatedAt: iso(row.updated_at),
+      };
+    });
+  }
+
+  // --- printing (D-818) -------------------------------------------------------------------
+
+  /**
+   * Print these orders' documents now: every lot, or the ones named. A document already printed
+   * for an order and lot is a reprint and needs a reason; the whole request is refused, naming
+   * them, rather than printing half of it. The printer is the one named, or the terminal's (the
+   * one named, else the label terminal this computer is bound to), else the order's own label
+   * terminal at its location (D-817). Up to 100 orders at once: how a person prints everything
+   * waiting in "Ready for label" in one go (D-917).
+   */
+  async print(
+    context: ActiveContext,
+    request: AuditableRequest,
+    input: PrintRequestInput,
+    token: string | null,
+  ) {
+    return mapPackingErrors(() =>
+      withOrg({ orgId: context.orgId, userId: context.userId }, async (tx) => {
+        // A label desk prints on its own printers; a packing desk on its own when it has one for
+        // the document (its slip printer), else where the order's labels print (D-802).
+        const here = await this.terminals.resolve(tx, context, token, 'any');
+        const ids = [...new Set(input.orderIds)];
+        const visible = await this.orders.visibleOrderIds(tx, context.orgId, ids, request);
+        if (ids.some((id) => !visible.has(id))) {
+          throw new PackingError('NOT_FOUND', 'No such order.');
+        }
+        // One print of an order's pages at a time, in the lock order every path takes (the
+        // order's row, then its lots; ledger audit W1, W3), so two presses of Print, or two
+        // people printing the same order, see each other and the second needs a reason.
+        for (const id of [...ids].sort()) await this.lockOrder(tx, context.orgId, id);
+        const facts = await this.orders.packingFacts(tx, context.orgId, ids);
+        for (const order of facts) {
+          if (!PRINTABLE_STATUSES.includes(order.status)) {
+            throw new PackingError(
+              'PACKING_NOT_PACKABLE',
+              `Order ${order.orderNo} is ${order.status}: its labels are printed while it is at the hub.`,
+            );
+          }
+        }
+        const [lots, printed, labelOrders, printers, terminals, openJobs] = await Promise.all([
+          repo.lotCounts(tx, context.orgId, ids),
+          repo.printedCounts(tx, context.orgId, ids, { pending: true }),
+          repo.labelOrderOf(tx, context.orgId, ids),
+          repo.printersOf(tx, context.orgId),
+          repo.terminalsOf(tx, context.orgId),
+          repo.openJobsByTerminal(tx, context.orgId),
+        ]);
+        const stationSeen = await this.stationsSeen(tx, context.orgId);
+        const consignmentOf = (order: (typeof facts)[number]): string | null =>
+          labelOrders.get(order.id)?.consignmentNo ?? order.parcel?.consignmentNo ?? null;
+        // D-928: a label carries the courier's consignment, so it prints only once the order is
+        // booked; the whole request is refused, naming the order, rather than printing half of it.
+        if (input.documents.includes('label')) {
+          const unbooked = facts.find((order) => consignmentOf(order) === null);
+          if (unbooked !== undefined) {
+            throw new PackingError(
+              'LABEL_NOT_BOOKED',
+              `Order ${unbooked.orderNo} is not booked with a courier yet: its label prints once the courier gives it a consignment number.`,
+            );
+          }
+        }
+
+        interface Planned {
+          order: (typeof facts)[number];
+          document: PrintedDocument;
+          lot: number;
+          lotCount: number;
+          printedBefore: number;
+        }
+        const planned: Planned[] = [];
+        for (const order of facts) {
+          const lotCount = lots.get(order.id) ?? 1;
+          const chosen = input.lots ?? Array.from({ length: lotCount }, (_, index) => index + 1);
+          for (const lot of chosen) {
+            if (lot > lotCount) {
+              throw new PackingError(
+                'LOTS_LOCKED',
+                `Order ${order.orderNo} is in ${String(lotCount)} ${lotCount === 1 ? 'lot' : 'lots'}: there is no lot ${String(lot)}.`,
+              );
+            }
+            for (const document of input.documents) {
+              planned.push({
+                order,
+                document,
+                lot,
+                lotCount,
+                printedBefore: printed.get(`${order.id}:${document}:${String(lot)}`) ?? 0,
+              });
+            }
+          }
+        }
+        const reprints = planned.filter((entry) => isReprint(entry.printedBefore));
+        if (reprints.length > 0 && input.reason === undefined) {
+          const first = reprints[0];
+          throw new PackingError(
+            'PRINT_REASON_REQUIRED',
+            first === undefined
+              ? 'Say why it is printed again.'
+              : `Order ${first.order.orderNo}'s ${first.document === 'label' ? 'label' : 'slip'} was printed before. Say why it is printed again.`,
+          );
+        }
+
+        const jobs: repo.JobRow[] = [];
+        for (const entry of planned) {
+          const printer = this.choosePrinter({
+            printers,
+            terminals,
+            openJobs,
+            stationSeen,
+            document: entry.document,
+            printerId: input.printerId,
+            terminalId:
+              input.terminalId ??
+              (here === null
+                ? undefined
+                : here.terminal.kind === 'label' ||
+                    printers.some(
+                      (printer) =>
+                        printer.terminal_id === here.terminal.id &&
+                        printer.enabled &&
+                        printer.documents.includes(entry.document),
+                    )
+                  ? here.terminal.id
+                  : undefined),
+            locationId: entry.order.locationId,
+          });
+          const job = await repo.insertJob(tx, {
+            orgId: context.orgId,
+            orderId: entry.order.id,
+            orderNo: entry.order.orderNo,
+            document: entry.document,
+            lotNo: entry.lot,
+            lotCount: entry.lotCount,
+            printerId: printer.id,
+            terminalId: printer.terminal_id,
+            source: isReprint(entry.printedBefore) ? 'reprint' : 'manual',
+            reason: isReprint(entry.printedBefore) ? (input.reason ?? null) : null,
+            requestedBy: context.userId,
+            copies: input.copies ?? printer.copies,
+            consignmentNo: consignmentOf(entry.order),
+          });
+          if (job === undefined) throw new Error('a print job was not written');
+          openJobs.set(printer.terminal_id, (openJobs.get(printer.terminal_id) ?? 0) + 1);
+          await this.dispatch(tx, context.orgId, job, printer);
+          jobs.push(job);
+        }
+        await this.audit.record(tx, {
+          orgId: context.orgId,
+          actorUserId: context.userId,
+          operation: 'create',
+          action: reprints.length > 0 ? 'labels.reprint_requested' : 'labels.print_requested',
+          entityType: 'print_job',
+          entityId: jobs[0]?.id ?? context.orgId,
+          after: {
+            jobs: jobs.map((job) => ({
+              id: job.id,
+              orderId: job.order_id,
+              document: job.document,
+              lot: job.lot_no,
+              printerId: job.printer_id,
+              source: job.source,
+            })),
+            reason: input.reason ?? null,
+            terminalId: here?.terminal.id ?? null,
+          },
+          request,
+        });
+        return { jobs: jobs.map((job) => this.presentJob(job, new Map(), printers, terminals)) };
+      }),
+    );
+  }
+
+  /** A test page on one printer (D-815): `update PackingTerminal`. */
+  async testPrint(context: ActiveContext, request: AuditableRequest, printerId: string) {
+    return mapPackingErrors(() =>
+      withOrg({ orgId: context.orgId, userId: context.userId }, async (tx) => {
+        const printer = await repo.printerById(tx, context.orgId, printerId);
+        if (printer?.deleted_at !== null) {
+          throw new PackingError('NOT_FOUND', 'No such printer.');
+        }
+        const job = await repo.insertJob(tx, {
+          orgId: context.orgId,
+          orderId: null,
+          orderNo: '',
+          document: 'test',
+          lotNo: 1,
+          lotCount: 1,
+          printerId: printer.id,
+          terminalId: printer.terminal_id,
+          source: 'test',
+          reason: null,
+          requestedBy: context.userId,
+          copies: 1,
+          consignmentNo: null,
+        });
+        if (job === undefined) throw new Error('a test print was not written');
+        await this.dispatch(tx, context.orgId, job, printer);
+        await this.audit.record(tx, {
+          orgId: context.orgId,
+          actorUserId: context.userId,
+          operation: 'create',
+          action: 'labels.test_print_requested',
+          entityType: 'print_job',
+          entityId: job.id,
+          after: { printerId: printer.id },
+          request,
+        });
+        return { jobId: job.id, state: job.state };
+      }),
+    );
+  }
+
+  async retry(context: ActiveContext, request: AuditableRequest, jobId: string) {
+    return mapPackingErrors(() =>
+      withOrg({ orgId: context.orgId, userId: context.userId }, async (tx) => {
+        const job = await this.jobInScope(tx, context, request, jobId, true);
+        const printer = await repo.printerById(tx, context.orgId, job.printer_id);
+        if (printer?.deleted_at !== null || !printer.enabled) {
+          throw new PackingError(
+            'PRINT_NO_PRINTER',
+            'That printer is no longer in use. Print it again elsewhere.',
+          );
+        }
+        const queued = await repo.requeueFailed(tx, context.orgId, jobId);
+        if (queued === undefined) {
+          throw new PackingError('PRINT_JOB_STATE', 'Only a failed print can be tried again.');
+        }
+        await this.dispatch(tx, context.orgId, queued, printer);
+        await this.audit.record(tx, {
+          orgId: context.orgId,
+          actorUserId: context.userId,
+          operation: 'update',
+          action: 'labels.job_retried',
+          entityType: 'print_job',
+          entityId: jobId,
+          before: { state: job.state, attempts: job.attempts },
+          after: { state: 'queued' },
+          request,
+        });
+        return { id: jobId, state: queued.state };
+      }),
+    );
+  }
+
+  /**
+   * D-1025: these printed pages did not come out of the printer (a jam, no paper, a printer that
+   * was off while Chrome said its print was over). Each goes back to `failed`, so its order is in
+   * Ready for label again, Print all or Retry prints it without a reason, and the order leaves
+   * "To pack" until its label prints. Only an order still confirmed: a packed order's label went
+   * on the parcel. All or nothing, naming the first page that cannot be put back.
+   */
+  async markNotPrinted(
+    context: ActiveContext,
+    request: AuditableRequest,
+    jobIds: readonly string[],
+  ) {
+    return mapPackingErrors(() =>
+      withOrg({ orgId: context.orgId, userId: context.userId }, async (tx) => {
+        const ids = [...new Set(jobIds)].sort();
+        const seen = [];
+        for (const id of ids) seen.push(await this.jobInScope(tx, context, request, id, false));
+        const orderIds = [
+          ...new Set(seen.flatMap((job) => (job.order_id === null ? [] : [job.order_id]))),
+        ].sort();
+        // The order's row, then its lots, then the jobs: the lock order every print path takes.
+        for (const orderId of orderIds) await this.lockOrder(tx, context.orgId, orderId);
+        const facts = await this.orders.packingFacts(tx, context.orgId, orderIds);
+        const packedOn = facts.find((order) => order.status !== 'confirmed');
+        if (packedOn !== undefined) {
+          throw new PackingError(
+            'PRINT_JOB_STATE',
+            `Order ${packedOn.orderNo} is ${packedOn.status}: its label is already on the parcel.`,
+          );
+        }
+        const by = (await this.names(tx, context.orgId)).get(context.userId) ?? 'a person';
+        const message = `Did not come out of the printer, said ${by}.`.slice(0, 300);
+        const marked: repo.JobRow[] = [];
+        for (const before of seen) {
+          const job = await this.jobInScope(tx, context, request, before.id, true);
+          const failed =
+            job.state === 'printed' && job.document !== 'test'
+              ? await repo.markNotPrinted(tx, context.orgId, job.id, message)
+              : undefined;
+          if (failed === undefined) {
+            throw new PackingError(
+              'PRINT_JOB_STATE',
+              job.document === 'test'
+                ? 'A test page is not put back.'
+                : `Only a printed page can be put back${job.order_no === '' ? '' : ` (order ${job.order_no}'s is ${job.state})`}.`,
+            );
+          }
+          marked.push(failed);
+          await this.changed(tx, context.orgId, failed, null);
+          await this.audit.record(tx, {
+            orgId: context.orgId,
+            actorUserId: context.userId,
+            operation: 'update',
+            action: 'labels.job_not_printed',
+            entityType: 'print_job',
+            entityId: job.id,
+            before: { state: 'printed', printedAt: job.printed_at },
+            after: { state: 'failed' },
+            request,
+          });
+        }
+        // Out of "To pack" until a label prints again (D-1024's rule for moving it there), but
+        // only an order now missing a lot's label: a reprint that did come out still covers it
+        // (ledger audit N1).
+        const labelled = [
+          ...new Set(
+            marked.flatMap((job) =>
+              job.document === 'label' && job.order_id !== null ? [job.order_id] : [],
+            ),
+          ),
+        ];
+        const [lotsOf, printedNow] = await Promise.all([
+          repo.lotCounts(tx, context.orgId, labelled),
+          repo.printedCounts(tx, context.orgId, labelled),
+        ]);
+        const missing = labelled.filter((orderId) =>
+          Array.from(
+            { length: lotsOf.get(orderId) ?? 1 },
+            (_, index) => printedNow.get(`${orderId}:label:${String(index + 1)}`) ?? 0,
+          ).some((count) => count === 0),
+        );
+        await this.orders.clearSlipsPrinted(tx, context.orgId, missing);
+        return { jobIds: marked.map((job) => job.id), orderIds };
+      }),
+    );
+  }
+
+  async cancel(context: ActiveContext, request: AuditableRequest, jobId: string) {
+    return mapPackingErrors(() =>
+      withOrg({ orgId: context.orgId, userId: context.userId }, async (tx) => {
+        const job = await this.jobInScope(tx, context, request, jobId, true);
+        const cancelled = await repo.cancelJob(
+          tx,
+          context.orgId,
+          jobId,
+          new Date(Date.now() - PRINT_SENDING_STALE_MS),
+        );
+        if (cancelled === undefined) {
+          throw new PackingError(
+            'PRINT_JOB_STATE',
+            'Only a waiting or failed print can be cancelled.',
+          );
+        }
+        await this.changed(tx, context.orgId, cancelled, null);
+        await this.audit.record(tx, {
+          orgId: context.orgId,
+          actorUserId: context.userId,
+          operation: 'update',
+          action: 'labels.job_cancelled',
+          entityType: 'print_job',
+          entityId: jobId,
+          before: { state: job.state },
+          after: { state: 'cancelled' },
+          request,
+        });
+        return { id: jobId, state: cancelled.state };
+      }),
+    );
+  }
+
+  // --- the queue and the log (D-818) ------------------------------------------------------
+
+  async jobs(
+    context: ActiveContext,
+    request: object,
+    query: PrintJobsQuery,
+    before?: { readonly createdAt: string; readonly id: string },
+  ) {
+    return withOrg({ orgId: context.orgId, userId: context.userId }, async (tx) => {
+      const page = await repo.jobsPage(tx, context.orgId, {
+        ...query,
+        before,
+        orderInScope: this.orders.orderInScopeSql(context.orgId, sql`j.order_id`, request),
+        testPages: defineAbilityFor(context).can('read', 'PackingTerminal'),
+      });
+      const [names, printers, terminals] = await Promise.all([
+        this.names(tx, context.orgId),
+        repo.printersOf(tx, context.orgId),
+        repo.terminalsOf(tx, context.orgId),
+      ]);
+      // A deleted printer still names its old jobs.
+      const missing = [...new Set(page.rows.map((row) => row.printer_id))].filter(
+        (id) => !printers.some((printer) => printer.id === id),
+      );
+      for (const id of missing) {
+        const old = await repo.printerById(tx, context.orgId, id);
+        if (old !== undefined) printers.push(old);
+      }
+      return {
+        total: page.total,
+        items: page.rows.map((row) => this.presentJob(row, names, printers, terminals)),
+      };
+    });
+  }
+
+  /** The log as CSV (D-818): the same filter, at most ten thousand rows, newest first. */
+  async exportCsv(context: ActiveContext, request: object, query: PrintJobsQuery) {
+    const rows: string[] = [
+      [
+        'created_at',
+        'order_no',
+        'document',
+        'lot',
+        'lots',
+        'printer',
+        'terminal',
+        'source',
+        'requested_by',
+        'reason',
+        'copies',
+        'state',
+        'attempts',
+        'printed_at',
+        'error',
+      ].join(','),
+    ];
+    let before: { createdAt: string; id: string } | undefined;
+    for (let read = 0; read < 10_000; read += 200) {
+      const page = await this.jobs(context, request, { ...query, limit: 200, offset: 0 }, before);
+      const lastItem = page.items.at(-1);
+      before =
+        lastItem === undefined ? undefined : { createdAt: lastItem.createdAt, id: lastItem.id };
+      for (const item of page.items) {
+        rows.push(
+          [
+            item.createdAt,
+            item.orderNo,
+            item.document,
+            item.lot,
+            item.lotCount,
+            item.printer.name,
+            item.terminal.name,
+            item.source,
+            item.requestedBy?.name ?? (item.source === 'auto' ? 'auto' : ''),
+            item.reason,
+            item.copies,
+            item.state,
+            item.attempts,
+            item.printedAt,
+            item.lastError,
+          ]
+            .map((cell) => csvCell(cell))
+            .join(','),
+        );
+      }
+      if (page.items.length < 200) break;
+    }
+    return `${rows.join('\r\n')}\r\n`;
+  }
+
+  /**
+   * Confirmed orders with a lot whose label has not printed, inside the caller's scope, at their
+   * location (or every location), oldest first (D-817). Since D-928 an order is here only once the
+   * courier has booked it, with its consignment; one still waiting for its booking, or whose
+   * booking failed, is not (Book now on the order brings it). The status is part of the query, so
+   * orders that moved on (cancelled, packed, shipped) never take the page's places.
+   */
+  async ready(context: ActiveContext, request: object, query: ReadyForLabelQuery) {
+    return withOrg({ orgId: context.orgId, userId: context.userId }, async (tx) => {
+      const rows = await repo.labelOrdersReady(tx, context.orgId, {
+        locationId: query.locationId,
+        limit: query.limit,
+        orderInScope: this.orders.orderInScopeSql(context.orgId, sql`lo.order_id`, request, [
+          'confirmed',
+        ]),
+      });
+      const ids = rows.map((row) => row.order_id);
+      const [facts, printed, names] = await Promise.all([
+        this.orders.packingFacts(tx, context.orgId, ids),
+        repo.printedCounts(tx, context.orgId, ids),
+        rows.some((row) => row.old_lot_count !== null)
+          ? this.names(tx, context.orgId)
+          : Promise.resolve(new Map<string, string>()),
+      ]);
+      const factOf = new Map(facts.map((fact) => [fact.id, fact]));
+      return {
+        items: rows.flatMap((row) => {
+          const order = factOf.get(row.order_id);
+          if (order?.status !== 'confirmed') return [];
+          return [
+            {
+              orderId: row.order_id,
+              orderNo: order.orderNo,
+              consignmentNo: row.consignment_no,
+              courier: order.parcel?.courierName ?? null,
+              customer: order.recipient.name,
+              locationId: order.locationId,
+              bookedAt: iso(row.booked_at),
+              lotCount: row.lot_count,
+              labelsPrinted: row.labels_printed,
+              // M52 (D-942): back because its lots were revised, with who changed them and when.
+              revised:
+                row.old_lot_count === null
+                  ? null
+                  : {
+                      fromLots: row.old_lot_count,
+                      by: row.lots_set_by === null ? null : (names.get(row.lots_set_by) ?? null),
+                      at: iso(row.lots_set_at),
+                    },
+              pieces: order.lines.reduce((sum, line) => sum + line.qty, 0),
+              codPoisha: order.codAmountPoisha.toString(),
+              lots: Array.from({ length: row.lot_count }, (_, index) => ({
+                lot: index + 1,
+                label: printed.get(`${row.order_id}:label:${String(index + 1)}`) ?? 0,
+                slip: printed.get(`${row.order_id}:packing_slip:${String(index + 1)}`) ?? 0,
+              })),
+            },
+          ];
+        }),
+      };
+    });
+  }
+
+  /**
+   * One order's prints (D-818): each lot's label and slip, how many times and the newest, and
+   * the whole history. "Printed 3 times, last 17 Oct 14:02 by Rahim at Label 1." And each lot's
+   * record (M53, D-948): what went in it, when it was packed and handed over, what came back.
+   */
+  async orderPrints(context: ActiveContext, request: object, orderId: string) {
+    return mapPackingErrors(() =>
+      withOrg({ orgId: context.orgId, userId: context.userId }, async (tx) => {
+        if (!(await this.orders.orderVisibleTo(tx, context.orgId, orderId, request))) {
+          throw new PackingError('NOT_FOUND', 'No such order.');
+        }
+        const [jobs, lotCount, names, printers, terminals, handover, facts, packing, returning] =
+          await Promise.all([
+            repo.jobsOfOrders(tx, context.orgId, [orderId]),
+            repo.lotCountOf(tx, context.orgId, orderId),
+            this.names(tx, context.orgId),
+            repo.printersOf(tx, context.orgId),
+            repo.terminalsOf(tx, context.orgId),
+            repo.handoverScansOf(tx, context.orgId, [orderId]),
+            this.orders.packingFacts(tx, context.orgId, [orderId]),
+            station.sessionByOrder(tx, context.orgId, orderId, 'pack'),
+            station.sessionByOrder(tx, context.orgId, orderId, 'return'),
+          ]);
+        const [packScans, closures, returnScans, bags] = await Promise.all([
+          packing === undefined ? [] : station.scansOf(tx, context.orgId, packing.id),
+          packing === undefined ? [] : repo.closuresOf(tx, context.orgId, packing.id),
+          returning === undefined ? [] : station.scansOf(tx, context.orgId, returning.id),
+          returning === undefined ? [] : rec.recordingsOf(tx, context.orgId, returning.id),
+        ]);
+        const contents = lotContents(
+          packScans.map((row) => ({ lot: row.lot_no, skuId: row.sku_id, outcome: row.outcome })),
+        );
+        const back = piecesByLot(
+          returnScans.map((row) => ({ lot: row.lot_no, outcome: row.outcome })),
+        );
+        const lineOf = new Map((facts[0]?.lines ?? []).map((line) => [line.skuId, line]));
+        const terminalName = new Map(terminals.map((terminal) => [terminal.id, terminal.name]));
+        const summaryOf = (document: PrintedDocument, lot: number) => {
+          const summary = printSummary(
+            jobs
+              // Pages printed for another lot count are history, not this lot's page (D-805).
+              .filter(
+                (job) =>
+                  job.document === document && job.lot_no === lot && job.lot_count === lotCount,
+              )
+              .map((job) => ({
+                state: job.state,
+                at: new Date(job.printed_at ?? job.created_at),
+                byName: job.requested_by === null ? null : (names.get(job.requested_by) ?? null),
+                auto: job.source === 'auto',
+                terminalName: terminalName.get(job.terminal_id) ?? null,
+              })),
+          );
+          return {
+            count: summary.count,
+            last:
+              summary.last === null
+                ? null
+                : {
+                    at: summary.last.at.toISOString(),
+                    by: summary.last.auto ? null : summary.last.byName,
+                    auto: summary.last.auto,
+                    terminal: summary.last.terminalName,
+                  },
+          };
+        };
+        return {
+          orderId,
+          lotCount,
+          lots: Array.from({ length: lotCount }, (_, index) => {
+            const lot = index + 1;
+            const handed = handover.find((scan) => scan.lot_no === lot);
+            const closure = closures.find((row) => row.lot_no === lot);
+            const bag = bags.filter((row) => row.lot_no === lot).at(-1);
+            return {
+              lot,
+              label: summaryOf('label', lot),
+              slip: summaryOf('packing_slip', lot),
+              handedAt: iso(handed?.scanned_at ?? null),
+              handedBy: handed === undefined ? null : (names.get(handed.scanned_by) ?? null),
+              // What went in it, as the packer scanned it; none for an order packed at the desk.
+              items: [...(contents.get(lot) ?? [])].map(([skuId, qty]) => ({
+                skuId,
+                skuCode: lineOf.get(skuId)?.skuCode ?? '',
+                name: lineOf.get(skuId)?.productName ?? '',
+                qty,
+              })),
+              packedAt: iso(
+                closure?.closed_at ?? (lotCount === 1 ? (packing?.completed_at ?? null) : null),
+              ),
+              // Its bag opened at the return station.
+              back:
+                bag === undefined
+                  ? null
+                  : { pieces: back.get(lot) ?? 0, at: iso(bag.stopped_at ?? bag.started_at) },
+            };
+          }),
+          history: [...jobs]
+            .reverse()
+            .map((job) => this.presentJob(job, names, printers, terminals)),
+        };
+      }),
+    );
+  }
+
+  // --- sending to a network printer (D-813), in the worker -------------------------------
+
+  /**
+   * Send one job: marked sending in its own short transaction, rendered and sent with none
+   * open, then marked printed, or failed when the tries are spent. A failed try with tries left
+   * goes back to queued and throws, so pg-boss sends it again after its delay.
+   */
+  async send(orgId: string, payload: SendPrintPayload): Promise<void> {
+    const prepared = await withOrg({ orgId }, async (tx) => {
+      const waiting = await repo.jobById(tx, orgId, payload.jobId);
+      if (waiting === undefined) return null;
+      const current = await repo.printerById(tx, orgId, waiting.printer_id);
+      if (current?.connection === 'browser') return null;
+      const job = await repo.markSending(tx, {
+        orgId,
+        id: payload.jobId,
+        staleBefore: new Date(Date.now() - PRINT_SENDING_STALE_MS),
+      });
+      if (job === undefined) return null;
+      const printer = await repo.printerById(tx, orgId, job.printer_id);
+      const terminal = await repo.terminalById(tx, orgId, job.terminal_id);
+      const sealed = await repo.printerSecret(tx, orgId, job.printer_id);
+      return { job, printer, terminal, sealed };
+    });
+    if (prepared === null) return;
+    const { job, printer, terminal } = prepared;
+
+    let error: PrintFailure | null = null;
+    try {
+      if (printer?.deleted_at !== null || !printer.enabled) {
+        throw new PrintFailure('The printer is switched off or deleted.', true);
+      }
+      if (printer.connection === 'browser' || printer.host === null) {
+        throw new PrintFailure('A browser print station prints its own jobs.', true);
+      }
+      const refusal = destinationRefusal(printer.host);
+      if (refusal !== null) throw new PrintFailure(refusal, true);
+      const page = await this.pageFor(orgId, job, printer, terminal?.name ?? '');
+      const rendered = await renderForPrinter(this.gotenberg, page, {
+        language: printer.language,
+        widthUm: printer.width_um,
+        heightUm: printer.height_um,
+        dpi: printer.dpi,
+        copies: job.copies,
+      });
+      if (printer.connection === 'raw') {
+        await this.transport.sendRaw(printer.host, printer.port ?? 9100, rendered.bytes, 30_000);
+      } else {
+        const port = printer.port ?? 631;
+        const scheme = printer.connection === 'ipps' ? 'ipps' : 'ipp';
+        const body = ippPrintJob(
+          {
+            printerUri: `${scheme}://${printer.host}:${String(port)}${printer.ipp_path}`,
+            user: 'erp',
+            jobName:
+              job.document === 'test'
+                ? 'Test print'
+                : `${job.order_no} ${job.document === 'label' ? 'label' : 'slip'} ${String(job.lot_no)}/${String(job.lot_count)}`,
+            copies: job.copies,
+          },
+          rendered.bytes,
+        );
+        const auth =
+          prepared.sealed === null || printer.username === ''
+            ? null
+            : {
+                user: printer.username,
+                password: openSealed(
+                  Buffer.from(prepared.sealed),
+                  printerPasswordBinding(orgId, printer.id),
+                ),
+              };
+        const answer = parseIppResponse(
+          await this.transport.ipp(
+            {
+              tls: printer.connection === 'ipps',
+              host: printer.host,
+              port,
+              path: printer.ipp_path,
+            },
+            body,
+            auth,
+            60_000,
+          ),
+        );
+        if (!ippSucceeded(answer.statusCode)) {
+          throw new PrintFailure(
+            `The printer refused the job (IPP status 0x${answer.statusCode.toString(16).padStart(4, '0')}).`,
+            answer.statusCode >= 0x0400 && answer.statusCode < 0x0500,
+          );
+        }
+      }
+    } catch (caught) {
+      error =
+        caught instanceof PrintFailure
+          ? caught
+          : caught instanceof PrinterIoError
+            ? new PrintFailure(caught.message, false)
+            : new PrintFailure(
+                'The page could not be made ready for the printer. Try again; if it fails again, tell the supervisor.',
+                false,
+              );
+      if (!(caught instanceof PrintFailure) && !(caught instanceof PrinterIoError)) {
+        this.logger.warn(
+          `print job ${job.id} failed: ${caught instanceof Error ? caught.message : String(caught)}`,
+        );
+      }
+    }
+
+    const final = error !== null && (error.final || job.attempts >= PRINT_MAX_ATTEMPTS);
+    await withOrg({ orgId }, async (tx) => {
+      if (error === null) {
+        const done = await repo.markPrinted(tx, { orgId, id: job.id });
+        if (done !== undefined) await this.printed(tx, orgId, done, null);
+        return;
+      }
+      const failed = await repo.markAttemptFailed(tx, {
+        orgId,
+        id: job.id,
+        error: error.message,
+        final,
+      });
+      if (failed !== undefined && final) await this.failed(tx, orgId, failed, null);
+    });
+    // Tries left: pg-boss sends it again after its delay (the row is queued again).
+    if (error !== null && !final) throw new Error(`print job ${job.id}: ${error.message}`);
+  }
+
+  /** Every enabled network printer, asked how it is (D-815). */
+  async probeAll(): Promise<void> {
+    const orgIds = await withGlobal(async (tx) =>
+      (
+        await tx.execute<{ id: string }>(
+          sql`select id from org.organizations where is_active order by slug`,
+        )
+      ).map((row) => row.id),
+    );
+    for (const orgId of orgIds) {
+      const printers = await withOrg({ orgId }, (tx) => repo.printersOf(tx, orgId));
+      for (const printer of printers) {
+        if (!printer.enabled || printer.connection === 'browser' || printer.host === null) continue;
+        let status: 'online' | 'offline' | 'error' = 'offline';
+        let detail: string | null = null;
+        const refusal = destinationRefusal(printer.host);
+        if (refusal !== null) {
+          status = 'error';
+          detail = 'address refused';
+        } else if (printer.connection === 'raw') {
+          status = (await this.transport.probeRaw(printer.host, printer.port ?? 9100, 3_000))
+            ? 'online'
+            : 'offline';
+        } else {
+          try {
+            const port = printer.port ?? 631;
+            const scheme = printer.connection === 'ipps' ? 'ipps' : 'ipp';
+            const answer = parseIppResponse(
+              await this.transport.ipp(
+                {
+                  tls: printer.connection === 'ipps',
+                  host: printer.host,
+                  port,
+                  path: printer.ipp_path,
+                },
+                ippGetPrinterAttributes({
+                  printerUri: `${scheme}://${printer.host}:${String(port)}${printer.ipp_path}`,
+                  user: 'erp',
+                }),
+                null,
+                3_000,
+              ),
+            );
+            const read = ippPrinterState(answer);
+            status = read.state;
+            detail = read.detail;
+            const formats = (answer.attributes.get('document-format-supported') ?? []).map(String);
+            if (formats.length > 0 && !formats.includes('application/pdf')) {
+              status = 'error';
+              detail = 'this printer does not take PDF';
+            }
+          } catch {
+            status = 'offline';
+          }
+        }
+        await withOrg({ orgId }, (tx) =>
+          repo.reportPrinterStatus(tx, { orgId, id: printer.id, status, detail }),
+        );
+      }
+    }
+  }
+
+  // --- the browser print station (D-816) -------------------------------------------------
+
+  /** The station's queue: its terminal's waiting jobs on its browser printers. */
+  async stationJobs(context: ActiveContext, request: object, token: string | null) {
+    return mapPackingErrors(() =>
+      withOrg({ orgId: context.orgId, userId: context.userId }, async (tx) => {
+        const here = await this.atLabelTerminal(tx, context, token);
+        const jobs = await repo.stationJobs(
+          tx,
+          context.orgId,
+          here.terminal.id,
+          // Another computer's job being sent is its own to finish (D-826 W2): listing it here
+          // made this station ask for it again and again (D-900's review).
+          here.deviceId,
+          this.orders.orderInScopeSql(context.orgId, sql`j.order_id`, request),
+        );
+        const printers = await repo.printersOf(tx, context.orgId);
+        const terminals = await repo.terminalsOf(tx, context.orgId);
+        return {
+          terminal: { id: here.terminal.id, name: here.terminal.name },
+          items: jobs.map((job) => this.presentJob(job, new Map(), printers, terminals)),
+        };
+      }),
+    );
+  }
+
+  /**
+   * One job's page for the station to print: the job is then being sent. A PDF, or (D-976) a
+   * black-and-white picture at the printer's dots, which the station prints in one dialog with
+   * the other waiting jobs.
+   */
+  async stationDocument(
+    context: ActiveContext,
+    request: object,
+    token: string | null,
+    jobId: string,
+    format: 'pdf' | 'png' = 'pdf',
+  ) {
+    return mapPackingErrors(async () => {
+      const prepared = await withOrg(
+        { orgId: context.orgId, userId: context.userId },
+        async (tx) => {
+          const here = await this.atLabelTerminal(tx, context, token);
+          const job = await this.jobInScope(tx, context, request, jobId, true);
+          if (job.terminal_id !== here.terminal.id) {
+            throw new PackingError('NOT_FOUND', 'No such print job at this terminal.');
+          }
+          const printer = await repo.printerById(tx, context.orgId, job.printer_id);
+          if (printer?.connection !== 'browser') {
+            throw new PackingError('NOT_FOUND', 'No such print job at this terminal.');
+          }
+          // Claimed for this computer: queued, or its own claim again after a reload (W2, W3).
+          const sending = await repo.claimForStation(tx, {
+            orgId: context.orgId,
+            id: jobId,
+            deviceId: here.deviceId,
+          });
+          if (sending === undefined) {
+            throw new PackingError('PRINT_JOB_STATE', 'This print is finished or cancelled.');
+          }
+          return { job: sending, printer, terminal: here.terminal };
+        },
+      );
+      // Rendered after the transaction (invariant 6: Gotenberg is a call).
+      const page = await this.pageFor(
+        context.orgId,
+        prepared.job,
+        prepared.printer,
+        prepared.terminal.name,
+      );
+      const paper = {
+        language: 'pdf',
+        widthUm: prepared.printer.width_um,
+        heightUm: prepared.printer.height_um,
+        dpi: prepared.printer.dpi,
+        copies: 1,
+      } as const;
+      const bytes =
+        format === 'png'
+          ? await renderPictureForBrowser(this.gotenberg, page, paper)
+          : (await renderForPrinter(this.gotenberg, page, paper)).bytes;
+      return {
+        bytes,
+        format,
+        filename: `${prepared.job.order_no === '' ? 'test' : prepared.job.order_no}-${prepared.job.document}-${String(prepared.job.lot_no)}.${format}`,
+        copies: prepared.job.copies,
+        widthUm: prepared.printer.width_um,
+        heightUm: prepared.printer.height_um,
+      };
+    });
+  }
+
+  /** The station says how it went: printed, or failed (and the label team is told). */
+  async stationResult(
+    context: ActiveContext,
+    request: AuditableRequest,
+    token: string | null,
+    jobId: string,
+    input: StationResultInput,
+  ) {
+    return mapPackingErrors(() =>
+      withOrg({ orgId: context.orgId, userId: context.userId }, async (tx) => {
+        const here = await this.atLabelTerminal(tx, context, token);
+        const job = await this.jobInScope(tx, context, request, jobId, true);
+        const printer = await repo.printerById(tx, context.orgId, job.printer_id);
+        // Only a browser printer's job, and only the one this computer claimed (W2).
+        if (job.terminal_id !== here.terminal.id || printer?.connection !== 'browser') {
+          throw new PackingError('NOT_FOUND', 'No such print job at this terminal.');
+        }
+        if (job.state === 'printed' && input.result === 'printed') {
+          return { id: jobId, state: job.state, repeated: true };
+        }
+        const done =
+          input.result === 'printed'
+            ? await repo.markPrinted(tx, {
+                orgId: context.orgId,
+                id: jobId,
+                deviceId: here.deviceId,
+                confirmedBy: context.userId,
+              })
+            : await repo.markAttemptFailed(tx, {
+                orgId: context.orgId,
+                id: jobId,
+                error: input.error ?? 'The print station could not print it.',
+                final: true,
+                deviceId: here.deviceId,
+                confirmedBy: context.userId,
+              });
+        if (done === undefined) {
+          throw new PackingError('PRINT_JOB_STATE', 'This print is finished or cancelled.');
+        }
+        if (input.result === 'printed') await this.printed(tx, context.orgId, done, context.userId);
+        else await this.failed(tx, context.orgId, done, context.userId);
+        await this.audit.record(tx, {
+          orgId: context.orgId,
+          actorUserId: context.userId,
+          operation: 'update',
+          action: input.result === 'printed' ? 'labels.station_printed' : 'labels.station_failed',
+          entityType: 'print_job',
+          entityId: jobId,
+          before: { state: job.state },
+          after: { state: done.state, deviceId: here.deviceId },
+          request,
+        });
+        return { id: jobId, state: done.state, repeated: false };
+      }),
+    );
+  }
+
+  // --- the parts ---------------------------------------------------------------------------
+
+  /** The order's row, then its lots: the lock order every lots and print path takes (W1). */
+  private async lockOrder(tx: Tx, orgId: string, orderId: string): Promise<void> {
+    await this.orders.bookingSnapshot(tx, orgId, orderId, { forUpdate: true });
+    await repo.lockOrderLots(tx, orgId, orderId);
+  }
+
+  private async atLabelTerminal(tx: Tx, context: ActiveContext, token: string | null) {
+    const here = await this.terminals.resolve(tx, context, token, 'label');
+    if (here === null) {
+      throw new PackingError(
+        'TERMINAL_DEVICE_INVALID',
+        'This computer is not bound to a label terminal. A supervisor binds it on the Terminals tab.',
+      );
+    }
+    return here;
+  }
+
+  /** The page a job prints: its order's slip or label for its lot, or a test page. */
+  private async pageFor(
+    orgId: string,
+    job: repo.JobRow,
+    printer: repo.PrinterRow,
+    terminalName: string,
+  ): Promise<PrintPage> {
+    if (job.document === 'test' || job.order_id === null) {
+      return testPage({
+        printerName: printer.name,
+        terminalName,
+        widthUm: printer.width_um,
+        heightUm: printer.height_um,
+        dpi: printer.dpi,
+        at: new Date().toLocaleString('en-GB', { timeZone: 'Asia/Dhaka' }),
+      });
+    }
+    try {
+      return await this.orders.documentForPrint({
+        orgId,
+        orderId: job.order_id,
+        kind: job.document,
+        lot: job.lot_count > 1 ? { no: job.lot_no, count: job.lot_count } : null,
+        paper: slipPaperFor(printer),
+      });
+    } catch (error) {
+      if ((error as { status?: unknown }).status === 404) {
+        throw new PrintFailure('The order is gone.', true);
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * The printer a document prints on: the one named (it must print that document), else the
+   * named terminal's, else the order's label terminal — the online one with the shortest queue
+   * among the active label terminals at its location or serving every location (D-817). An order
+   * with no location of its own (a desk order that names none) prints at any active label
+   * terminal (D-914): no terminal is wrong for it, and refusing left it unprinted.
+   */
+  private choosePrinter(input: {
+    readonly printers: readonly repo.PrinterRow[];
+    readonly terminals: readonly repo.TerminalRow[];
+    readonly openJobs: ReadonlyMap<string, number>;
+    readonly stationSeen: ReadonlyMap<string, Date>;
+    readonly document: PrintedDocument;
+    readonly printerId: string | undefined;
+    readonly terminalId: string | undefined;
+    readonly locationId: string | null;
+  }): repo.PrinterRow {
+    const now = new Date();
+    const active = new Map(
+      input.terminals
+        .filter((terminal) => terminal.active)
+        .map((terminal) => [terminal.id, terminal]),
+    );
+    const usable = input.printers.filter(
+      (printer) =>
+        printer.enabled &&
+        printer.deleted_at === null &&
+        active.has(printer.terminal_id) &&
+        printer.documents.includes(input.document),
+    );
+    const online = (printer: repo.PrinterRow) =>
+      printerOnline({
+        connection: printer.connection,
+        enabled: printer.enabled,
+        status: printer.status,
+        statusAt: at(printer.status_at),
+        stationSeenAt: input.stationSeen.get(printer.terminal_id) ?? null,
+        now,
+      });
+    if (input.printerId !== undefined) {
+      const named = usable.find((printer) => printer.id === input.printerId);
+      if (named === undefined) {
+        throw new PackingError(
+          'PRINT_NO_PRINTER',
+          `That printer does not print ${input.document === 'label' ? 'labels' : 'slips'}, or is switched off.`,
+        );
+      }
+      return named;
+    }
+    const pickFrom = (printers: readonly repo.PrinterRow[]) => printers.find(online) ?? printers[0];
+    if (input.terminalId !== undefined) {
+      const at = usable.filter((printer) => printer.terminal_id === input.terminalId);
+      const chosen = pickFrom(at);
+      if (chosen === undefined) {
+        throw new PackingError(
+          'PRINT_NO_PRINTER',
+          `This terminal has no printer for ${input.document === 'label' ? 'labels' : 'slips'}. Add one on the Printers tab.`,
+        );
+      }
+      return chosen;
+    }
+    const candidates = [...active.values()]
+      .filter(
+        (terminal) =>
+          terminal.kind === 'label' &&
+          (input.locationId === null ||
+            terminal.location_id === null ||
+            terminal.location_id === input.locationId) &&
+          usable.some((printer) => printer.terminal_id === terminal.id),
+      )
+      .map((terminal) => ({
+        id: terminal.id,
+        name: terminal.name,
+        online: usable.some((printer) => printer.terminal_id === terminal.id && online(printer)),
+        queued: input.openJobs.get(terminal.id) ?? 0,
+      }));
+    const terminal = pickTerminal(candidates);
+    const chosen =
+      terminal === null
+        ? undefined
+        : pickFrom(usable.filter((printer) => printer.terminal_id === terminal.id));
+    if (chosen === undefined) {
+      throw new PackingError(
+        'PRINT_NO_PRINTER',
+        input.locationId === null
+          ? `No active label terminal has a printer for ${input.document === 'label' ? 'labels' : 'slips'}.`
+          : `No label terminal at this order's location has a printer for ${input.document === 'label' ? 'labels' : 'slips'}.`,
+      );
+    }
+    return chosen;
+  }
+
+  /** When each terminal's browser last checked in: a browser printer is online while it does. */
+  private async stationsSeen(tx: Tx, orgId: string): Promise<Map<string, Date>> {
+    const seen = new Map<string, Date>();
+    for (const device of await repo.devicesOf(tx, orgId)) {
+      if (device.last_seen_at === null) continue;
+      const when = new Date(device.last_seen_at);
+      const before = seen.get(device.terminal_id);
+      if (before === undefined || when > before) seen.set(device.terminal_id, when);
+    }
+    return seen;
+  }
+
+  /** Hand a queued job to its printer, in the caller's transaction (invariant 6). */
+  private async dispatch(
+    tx: Tx,
+    orgId: string,
+    job: repo.JobRow,
+    printer: repo.PrinterRow,
+  ): Promise<void> {
+    if (printer.connection !== 'browser') {
+      const payload: SendPrintPayload = { jobId: job.id };
+      await enqueue(tx, PACKING_QUEUES.send.name, payload, { orgId, ref: job.id });
+    }
+    await this.changed(tx, orgId, job, null);
+  }
+
+  private async changed(
+    tx: Tx,
+    orgId: string,
+    job: repo.JobRow,
+    reason: string | null,
+  ): Promise<void> {
+    await emit(
+      tx,
+      'labels.job_changed',
+      {
+        jobId: job.id,
+        terminalId: job.terminal_id,
+        printerId: job.printer_id,
+        state: job.state,
+        reason: reason?.slice(0, 200) ?? null,
+      },
+      { orgId },
+    );
+  }
+
+  /** A job printed: the order moves on at the hub (D-819), the team hears it, the log says so. */
+  private async printed(
+    tx: Tx,
+    orgId: string,
+    job: repo.JobRow,
+    confirmedBy: string | null,
+  ): Promise<void> {
+    // D-1024: only its label, carrying the courier's consignment, moves an order to "To pack".
+    // A packing slip printed for an order still waiting for its booking used to move it there,
+    // and the hub then saw an order to pack that the courier had never heard of (D-928).
+    if (job.order_id !== null && job.document === 'label' && job.consignment_no !== null) {
+      await this.orders.markSlipsPrinted(tx, orgId, [job.order_id]);
+    }
+    await this.changed(tx, orgId, job, null);
+    if (confirmedBy === null) {
+      await this.audit.record(tx, {
+        orgId,
+        actorUserId: null,
+        operation: 'update',
+        action: 'labels.job_printed',
+        entityType: 'print_job',
+        entityId: job.id,
+        after: { state: 'printed', attempts: job.attempts, printerId: job.printer_id },
+      });
+    }
+  }
+
+  /** A job failed for good: the label team is told (D-813), the log keeps why. */
+  private async failed(
+    tx: Tx,
+    orgId: string,
+    job: repo.JobRow,
+    confirmedBy: string | null,
+  ): Promise<void> {
+    await this.changed(tx, orgId, job, job.last_error);
+    if (confirmedBy === null) {
+      await this.audit.record(tx, {
+        orgId,
+        actorUserId: null,
+        operation: 'update',
+        action: 'labels.job_failed',
+        entityType: 'print_job',
+        entityId: job.id,
+        after: { state: 'failed', attempts: job.attempts, error: job.last_error },
+      });
+    }
+  }
+
+  private async jobInScope(
+    tx: Tx,
+    context: ActiveContext,
+    request: object,
+    jobId: string,
+    forUpdate: boolean,
+  ): Promise<repo.JobRow> {
+    const job = await repo.jobById(tx, context.orgId, jobId, { forUpdate });
+    if (
+      job === undefined ||
+      (job.order_id !== null &&
+        !(await this.orders.orderVisibleTo(tx, context.orgId, job.order_id, request)))
+    ) {
+      throw new PackingError('NOT_FOUND', 'No such print job.');
+    }
+    return job;
+  }
+
+  private async names(tx: Tx, orgId: string): Promise<Map<string, string>> {
+    return new Map(await this.iam.nameBook(tx, orgId));
+  }
+
+  private presentJob(
+    job: repo.JobRow,
+    names: ReadonlyMap<string, string>,
+    printers: readonly repo.PrinterRow[],
+    terminals: readonly repo.TerminalRow[],
+  ) {
+    const printer = printers.find((one) => one.id === job.printer_id);
+    const terminal = terminals.find((one) => one.id === job.terminal_id);
+    return {
+      id: job.id,
+      orderId: job.order_id,
+      orderNo: job.order_no,
+      document: job.document,
+      lot: job.lot_no,
+      lotCount: job.lot_count,
+      printer: {
+        id: job.printer_id,
+        name: printer?.name ?? '',
+        connection: printer?.connection ?? null,
+        state:
+          printer === undefined
+            ? 'unknown'
+            : printerShownState({
+                connection: printer.connection,
+                enabled: printer.enabled,
+                status: printer.status,
+                statusAt: at(printer.status_at),
+                stationSeenAt: null,
+                now: new Date(),
+              }),
+      },
+      terminal: { id: job.terminal_id, name: terminal?.name ?? '' },
+      source: job.source,
+      reason: job.reason,
+      requestedBy:
+        job.requested_by === null
+          ? null
+          : { id: job.requested_by, name: names.get(job.requested_by) ?? null },
+      confirmedBy:
+        job.confirmed_by === null
+          ? null
+          : { id: job.confirmed_by, name: names.get(job.confirmed_by) ?? null },
+      copies: job.copies,
+      consignmentNo: job.consignment_no,
+      state: job.state,
+      attempts: job.attempts,
+      lastError: job.last_error,
+      createdAt: iso(job.created_at) ?? '',
+      printedAt: iso(job.printed_at),
+      failedAt: iso(job.failed_at),
+    };
+  }
+}

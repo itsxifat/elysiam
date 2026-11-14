@@ -1,0 +1,145 @@
+import { Injectable } from '@nestjs/common';
+import type { Tx } from '@elysium/db';
+import {
+  ZERO_RETURNS,
+  type ReturnCounts,
+  type StaffPeriod,
+  type TimelineItem,
+} from '@elysium/domain/staff-activity';
+
+import type { AuditableRequest } from '../../platform/audit/audit.interceptor.js';
+import type { ActiveContext } from '../../platform/http/context.js';
+import * as repo from './courier.repository.js';
+import type { ReceiveReturnInput } from './courier.schemas.js';
+import { ReturnsService } from './returns.service.js';
+import * as staff from './staff.repository.js';
+
+/**
+ * What the courier module offers other modules (invariant 12): the parcel an order went out in
+ * and the receipt of a returned parcel (M51, D-934). The packing module's return station scans
+ * and films the returned pieces and books the receipt here, in its own transaction, so the
+ * inspection, the receipt, the stock and the journal are one unit.
+ */
+export interface CourierApi {
+  /**
+   * The order's live parcel, if it has one: its id and the codes printed on it. `forUpdate` takes
+   * the consignment's lock, the first a receipt takes.
+   */
+  parcelOfOrder(
+    tx: Tx,
+    orgId: string,
+    orderId: string,
+    options?: { readonly forUpdate?: boolean },
+  ): Promise<ReturnParcel | null>;
+
+  /**
+   * Receive and inspect a returned parcel inside the caller's transaction: the receipt, the
+   * courier event, the order's `receive_return` and its stock and journal. Throws the courier
+   * module's own refusals (`CourierError`).
+   */
+  receiveReturn(
+    tx: Tx,
+    context: ActiveContext,
+    request: AuditableRequest,
+    consignmentId: string,
+    input: ReceiveReturnInput,
+  ): Promise<{ readonly receiptId: string; readonly orderStatus: string }>;
+
+  /** M57 (D-1006): returned parcels each person received in `[from, to)`, by user id. */
+  staffCounts(
+    tx: Tx,
+    orgId: string,
+    period: StaffPeriod,
+  ): Promise<ReadonlyMap<string, ReturnCounts>>;
+
+  /** M57: one person's receipts for the timeline, newest first. */
+  staffTimeline(
+    tx: Tx,
+    orgId: string,
+    userId: string,
+    period: StaffPeriod,
+    limit: number,
+  ): Promise<readonly TimelineItem[]>;
+}
+
+export interface ReturnParcel {
+  readonly consignmentId: string;
+  readonly consignmentNo: string | null;
+  readonly trackingCode: string | null;
+  readonly status: string;
+  readonly courierId: string | null;
+}
+
+export const COURIER_API = Symbol('CourierApi');
+
+/** The implementation. Registered under `COURIER_API` by `CourierModule`. */
+@Injectable()
+export class CourierApiService implements CourierApi {
+  constructor(private readonly returns: ReturnsService) {}
+
+  async staffCounts(
+    tx: Tx,
+    orgId: string,
+    period: StaffPeriod,
+  ): Promise<ReadonlyMap<string, ReturnCounts>> {
+    const counts = new Map<string, ReturnCounts>();
+    for (const row of await staff.receiptCounts(tx, orgId, period)) {
+      counts.set(row.user_id, {
+        ...ZERO_RETURNS,
+        received: row.received,
+        piecesReceived: row.pieces,
+        damagedPieces: row.damaged,
+      });
+    }
+    return counts;
+  }
+
+  async staffTimeline(
+    tx: Tx,
+    orgId: string,
+    userId: string,
+    period: StaffPeriod,
+    limit: number,
+  ): Promise<readonly TimelineItem[]> {
+    return (await staff.timeline(tx, orgId, userId, period, limit)).map((row) => ({
+      id: `courier:return_received:${row.id}`,
+      at: new Date(row.at),
+      desk: 'returns' as const,
+      kind: 'return.received',
+      ref: { type: 'order' as const, id: row.order_id, label: null },
+      detail: { pieces: row.pieces, damaged: row.damaged },
+    }));
+  }
+
+  async parcelOfOrder(
+    tx: Tx,
+    orgId: string,
+    orderId: string,
+    options: { readonly forUpdate?: boolean } = {},
+  ): Promise<ReturnParcel | null> {
+    const found = await repo.consignmentByOrder(tx, orgId, orderId);
+    if (found === undefined) return null;
+    const row =
+      options.forUpdate === true
+        ? ((await repo.consignmentForUpdate(tx, orgId, found.id)) ?? found)
+        : found;
+    return {
+      consignmentId: row.id,
+      consignmentNo: row.consignment_no,
+      trackingCode: row.tracking_code,
+      status: row.status,
+      courierId: row.courier_id,
+    };
+  }
+
+  async receiveReturn(
+    tx: Tx,
+    context: ActiveContext,
+    request: AuditableRequest,
+    consignmentId: string,
+    input: ReceiveReturnInput,
+  ) {
+    const received = await this.returns.receiveIn(tx, context, request, consignmentId, input);
+    return { receiptId: received.receiptId, orderStatus: received.orderStatus };
+  }
+}

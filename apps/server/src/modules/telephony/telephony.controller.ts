@@ -1,0 +1,413 @@
+import {
+  BadRequestException,
+  Body,
+  Controller,
+  Delete,
+  Get,
+  HttpCode,
+  Param,
+  Post,
+  Put,
+  Query,
+  Req,
+  Res,
+} from '@nestjs/common';
+import {
+  callerPanelQuerySchema,
+  customerPinnedNoteSchema,
+  phoneCallAnsweredSchema,
+  phoneCallListQuerySchema,
+  phoneCallPlaceSchema,
+  phoneCallWrapUpSchema,
+  phoneLookupQuerySchema,
+  telephonyAssignSchema,
+  telephonyConnectionCreateSchema,
+  telephonyConnectionUpdateSchema,
+} from '@elysium/contracts/telephony';
+import type { FastifyReply, FastifyRequest } from 'fastify';
+import { Readable } from 'node:stream';
+import { z } from 'zod';
+
+import {
+  auditNothingChanged,
+  type AuditableRequest,
+} from '../../platform/audit/audit.interceptor.js';
+import { RequireAbility } from '../../platform/auth/abilities.js';
+import { scopeHasNoRowDimension } from '../../platform/auth/scope.js';
+import { requireContext } from '../../platform/http/context.js';
+import { CallerPanelService } from './caller-panel.service.js';
+import { TelephonyCallsService } from './calls.service.js';
+import { TelephonyConnectionsService } from './connections.service.js';
+import { TelephonyError, telephonyHttpError } from './telephony.errors.js';
+
+const idSchema = z.string().uuid('No such record.');
+const extensionSchema = z.string().regex(/^[0-9]{2,8}$/, 'An extension is two to eight digits.');
+const envoCallIdSchema = z.string().regex(/^[0-9]{1,20}(\.[0-9]{1,10})?$/, 'No such call.');
+
+function parse<T extends z.ZodType>(schema: T, value: unknown): z.infer<T> {
+  const parsed = schema.safeParse(value);
+  if (!parsed.success) {
+    const issue = parsed.error.issues[0];
+    throw new BadRequestException({
+      code: 'VALIDATION_FAILED',
+      message:
+        issue === undefined
+          ? 'That is not valid.'
+          : `${issue.path.join('.') || 'body'}: ${issue.message}`,
+    });
+  }
+  return parsed.data;
+}
+
+const auditable = (request: FastifyRequest): AuditableRequest =>
+  request as unknown as AuditableRequest;
+
+/**
+ * Phone calls through Envo over HTTP (M47, D-830 to D-853).
+ *
+ * - Settings → Calls: `read Telephony` (org_admin, branch_manager) to see the connections and the
+ *   calls in progress, `create`/`update Telephony` (org_admin) to add, change and test one;
+ *   `read`/`update PhoneExtension` (org_admin, branch_manager) for the extensions and who has
+ *   them.
+ * - Calling: `create PhoneCall` (org_admin, branch_manager, and sales from their own extension)
+ *   to call, to wrap up their own calls (D-859), for the web phone's token and the screen pop;
+ *   `read PhoneCall` for the log and the recordings (sales: their own and their orders' calls,
+ *   D-841); `update PhoneCall` (the supervisors) to hang up a call in progress.
+ */
+@Controller('v1/telephony')
+export class TelephonyController {
+  constructor(
+    private readonly connections: TelephonyConnectionsService,
+    private readonly calls: TelephonyCallsService,
+    private readonly callerPanels: CallerPanelService,
+  ) {}
+
+  // --- Settings → Calls --------------------------------------------------------------------------
+
+  @RequireAbility('read', 'Telephony')
+  @Get('connections')
+  async listConnections(@Req() request: FastifyRequest) {
+    return this.connections.list(requireContext(request));
+  }
+
+  @RequireAbility('create', 'Telephony')
+  @Post('connections')
+  async createConnection(@Req() request: FastifyRequest, @Body() body: unknown) {
+    return this.connections.create(
+      requireContext(request),
+      auditable(request),
+      parse(telephonyConnectionCreateSchema, body),
+    );
+  }
+
+  @RequireAbility('update', 'Telephony')
+  @Put('connections/:id')
+  async updateConnection(
+    @Req() request: FastifyRequest,
+    @Param('id') id: string,
+    @Body() body: unknown,
+  ) {
+    return this.connections.update(
+      requireContext(request),
+      auditable(request),
+      parse(idSchema, id),
+      parse(telephonyConnectionUpdateSchema, body),
+    );
+  }
+
+  /** Reads Envo's extensions and numbers with the connection's key (acceptance check 1). */
+  @RequireAbility('update', 'Telephony')
+  @Post('connections/:id/test')
+  @HttpCode(200)
+  async testConnection(@Req() request: FastifyRequest, @Param('id') id: string) {
+    return this.connections.test(requireContext(request), auditable(request), parse(idSchema, id));
+  }
+
+  @RequireAbility('read', 'PhoneExtension')
+  @Get('connections/:id/extensions')
+  async extensions(@Req() request: FastifyRequest, @Param('id') id: string) {
+    return this.connections.extensions(requireContext(request), parse(idSchema, id));
+  }
+
+  @RequireAbility('update', 'PhoneExtension')
+  @Put('connections/:id/extensions/:extension')
+  async assign(
+    @Req() request: FastifyRequest,
+    @Param('id') id: string,
+    @Param('extension') extension: string,
+    @Body() body: unknown,
+  ) {
+    const input = parse(telephonyAssignSchema, {
+      ...(typeof body === 'object' && body !== null ? body : {}),
+      extension,
+    });
+    return this.connections.assign(
+      requireContext(request),
+      auditable(request),
+      parse(idSchema, id),
+      input.extension,
+      input.userId,
+    );
+  }
+
+  @RequireAbility('update', 'PhoneExtension')
+  @Delete('connections/:id/extensions/:extension')
+  async unassign(
+    @Req() request: FastifyRequest,
+    @Param('id') id: string,
+    @Param('extension') extension: string,
+  ) {
+    return this.connections.unassign(
+      requireContext(request),
+      auditable(request),
+      parse(idSchema, id),
+      parse(extensionSchema, extension),
+    );
+  }
+
+  /** Who has which extension, brand-wide (the Staff screen). */
+  @RequireAbility('read', 'PhoneExtension')
+  @Get('assignments')
+  async assignments(@Req() request: FastifyRequest) {
+    return this.connections.assignments(requireContext(request));
+  }
+
+  @RequireAbility('read', 'Telephony')
+  @Get('connections/:id/live')
+  async live(@Req() request: FastifyRequest, @Param('id') id: string) {
+    return this.connections.live(requireContext(request), parse(idSchema, id));
+  }
+
+  @RequireAbility('update', 'PhoneCall')
+  @Post('connections/:id/live/:callId/hangup')
+  @HttpCode(200)
+  async hangup(
+    @Req() request: FastifyRequest,
+    @Param('id') id: string,
+    @Param('callId') callId: string,
+  ) {
+    scopeHasNoRowDimension(request, 'a call in progress on the brand’s SIP server, by Envo’s id');
+    return this.connections.hangup(
+      requireContext(request),
+      auditable(request),
+      parse(idSchema, id),
+      parse(envoCallIdSchema, callId),
+    );
+  }
+
+  // --- calling -----------------------------------------------------------------------------------
+
+  @RequireAbility('read', 'PhoneCall')
+  @Get('me')
+  async me(@Req() request: FastifyRequest) {
+    return this.calls.me(requireContext(request), request);
+  }
+
+  /** The web phone's token, for the caller's own extension (D-843). */
+  @RequireAbility('create', 'PhoneCall')
+  @Get('phone/token')
+  async phoneToken(
+    @Req() request: FastifyRequest,
+    @Res({ passthrough: true }) reply: FastifyReply,
+  ) {
+    void reply.header('cache-control', 'no-store');
+    return this.calls.phoneToken(requireContext(request), request);
+  }
+
+  /**
+   * The screen pop (D-843): a POST with the caller's number in the body, so it stays out of URLs
+   * and access logs (invariant 10), as the tracking page's `POST /v1/track` does. A read: it
+   * writes no audit row (the buyer's name and orders would be kept forever for every ring).
+   */
+  @RequireAbility('create', 'PhoneCall')
+  @Post('lookup')
+  @HttpCode(200)
+  async lookup(@Req() request: FastifyRequest, @Body() body: unknown) {
+    auditNothingChanged(
+      auditable(request),
+      'the screen pop reads the caller’s customer; a POST only to keep the number out of URLs',
+    );
+    return this.calls.lookup(
+      requireContext(request),
+      request,
+      parse(phoneLookupQuerySchema, body).phone,
+    );
+  }
+
+  /**
+   * The caller panel (D-860): a buyer's orders, contacts, inbox and every call with them, by a
+   * phone, a customer or a call. A POST so the number stays out of URLs (invariant 10); a read,
+   * so no audit row. `no-store`: it names a buyer's addresses and phones.
+   */
+  @RequireAbility('read', 'PhoneCall')
+  @Post('caller-panel')
+  @HttpCode(200)
+  async callerPanel(
+    @Req() request: FastifyRequest,
+    @Res({ passthrough: true }) reply: FastifyReply,
+    @Body() body: unknown,
+  ) {
+    auditNothingChanged(
+      auditable(request),
+      'the caller panel reads a buyer; a POST only to keep the number out of URLs',
+    );
+    void reply.header('cache-control', 'no-store');
+    return this.callerPanels.panel(
+      requireContext(request),
+      request,
+      parse(callerPanelQuerySchema, body ?? {}),
+    );
+  }
+
+  /** Call a customer from your own extension; an order needs its owner acknowledged (D-710). */
+  @RequireAbility('create', 'PhoneCall')
+  @Post('calls')
+  async place(@Req() request: FastifyRequest, @Body() body: unknown) {
+    return this.calls.place(
+      requireContext(request),
+      auditable(request),
+      parse(phoneCallPlaceSchema, body),
+    );
+  }
+
+  @RequireAbility('create', 'PhoneCall')
+  @Post('calls/answered')
+  @HttpCode(200)
+  async answered(@Req() request: FastifyRequest, @Body() body: unknown) {
+    return this.calls.answered(
+      requireContext(request),
+      auditable(request),
+      parse(phoneCallAnsweredSchema, body),
+    );
+  }
+
+  /**
+   * The call log by its query string. A phone filter is refused here (D-845): a query string
+   * reaches the proxies' access logs, so a phone is searched for with `POST calls/search`.
+   */
+  @RequireAbility('read', 'PhoneCall')
+  @Get('calls')
+  async list(@Req() request: FastifyRequest, @Query() query: unknown) {
+    const filters = parse(phoneCallListQuerySchema, query);
+    if (filters.phone !== undefined) {
+      throw telephonyHttpError(
+        new TelephonyError(
+          'TELEPHONY_INVALID',
+          'Search by phone with POST /v1/telephony/calls/search, so the number stays out of URLs.',
+        ),
+      );
+    }
+    return this.calls.list(requireContext(request), request, filters);
+  }
+
+  /**
+   * The call log with its filters in the body (the Calls page's): a phone filter stays out of
+   * URLs and access logs (invariant 10). The same answer as `GET calls`, and like it a read that
+   * writes no audit row.
+   */
+  @RequireAbility('read', 'PhoneCall')
+  @Post('calls/search')
+  @HttpCode(200)
+  async search(@Req() request: FastifyRequest, @Body() body: unknown) {
+    auditNothingChanged(
+      auditable(request),
+      'the call log reads calls; a POST only to keep a phone filter out of URLs',
+    );
+    return this.calls.list(requireContext(request), request, parse(phoneCallListQuerySchema, body));
+  }
+
+  /** The viewer's own calls that wait for their wrap-up (D-859): the work dock's card. */
+  @RequireAbility('create', 'PhoneCall')
+  @Get('calls/wrap-ups')
+  async wrapUps(@Req() request: FastifyRequest) {
+    return this.calls.wrapUps(requireContext(request), request);
+  }
+
+  @RequireAbility('read', 'PhoneCall')
+  @Get('calls/:id')
+  async one(@Req() request: FastifyRequest, @Param('id') id: string) {
+    return this.calls.one(requireContext(request), request, parse(idSchema, id));
+  }
+
+  /**
+   * A call's recording, to a person who may see the call (D-841), streamed from Envo as it comes
+   * (D-858): the bytes, not JSON, so `@Res()` and a manual send (nothing in a recording is a
+   * cost). The browser's `Range` goes to Envo and Envo's 200, 206 or 416 comes back, so the
+   * player can seek; the listener's going away drops Envo's request. `no-store`: a customer's
+   * voice is not kept in the browser's cache, where another account on the same browser could be
+   * served it without the scope check.
+   */
+  @RequireAbility('read', 'PhoneCall')
+  @Get('calls/:id/recording')
+  async recording(
+    @Req() request: FastifyRequest,
+    @Param('id') id: string,
+    @Res() reply: FastifyReply,
+  ) {
+    const gone = new AbortController();
+    reply.raw.on('close', () => {
+      if (!reply.raw.writableFinished) gone.abort();
+    });
+    const header = (name: string) => {
+      const value = request.headers[name];
+      return typeof value === 'string' ? value : null;
+    };
+    const recording = await this.calls.recording(
+      requireContext(request),
+      request,
+      parse(idSchema, id),
+      { range: header('range'), ifRange: header('if-range'), signal: gone.signal },
+    );
+    reply
+      .status(recording.status)
+      .header('cache-control', 'no-store')
+      .header('x-content-type-options', 'nosniff')
+      .header('content-disposition', 'inline');
+    if (recording.acceptRanges !== null) reply.header('accept-ranges', recording.acceptRanges);
+    if (recording.contentRange !== null) reply.header('content-range', recording.contentRange);
+    if (recording.body === null || recording.contentType === null) {
+      await reply.send();
+      return;
+    }
+    reply.header('content-type', recording.contentType);
+    if (recording.contentLength !== null) reply.header('content-length', recording.contentLength);
+    await reply.send(Readable.fromWeb(recording.body));
+  }
+
+  /**
+   * The person's wrap-up after their call (D-859), once; on a call about an order that can still
+   * be called about it is also M41's attempt (D-838), so a colleague's order needs
+   * `x-acknowledge-owner: 1`.
+   */
+  @RequireAbility('create', 'PhoneCall')
+  @Post('calls/:id/wrap-up')
+  async wrapUp(@Req() request: FastifyRequest, @Param('id') id: string, @Body() body: unknown) {
+    return this.calls.wrapUp(
+      requireContext(request),
+      auditable(request),
+      parse(idSchema, id),
+      parse(phoneCallWrapUpSchema, body),
+    );
+  }
+}
+
+/**
+ * The note pinned on top of a buyer's caller panel (M47, D-860): what to do with them, or who was
+ * handling them. `read PhoneCall`, the panel's own ability, and the panel's own rule for who sees
+ * the whole of it (D-863, `CallerPanelService.pin`); an empty body clears it.
+ */
+@Controller('v1/customers')
+export class CustomerPinnedNoteController {
+  constructor(private readonly callerPanels: CallerPanelService) {}
+
+  @RequireAbility('read', 'PhoneCall')
+  @Put(':id/pinned-note')
+  async pinNote(@Req() request: FastifyRequest, @Param('id') id: string, @Body() body: unknown) {
+    return this.callerPanels.pin(
+      requireContext(request),
+      auditable(request),
+      parse(idSchema, id),
+      parse(customerPinnedNoteSchema, body).body,
+    );
+  }
+}

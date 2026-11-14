@@ -1,0 +1,1393 @@
+import { Inject, Injectable, Logger } from '@nestjs/common';
+import type { Tx } from '@elysium/db';
+import {
+  applicableAdvance,
+  computePartialDelivery,
+  dispatchValue,
+  orderDeliveredDraft,
+  orderPartialReturnDraft,
+  orderReturnDraft,
+  partialReturnAmounts,
+  poisha,
+  returnableQty,
+  returnShortDraft,
+  splitReturn,
+  stillOutQty,
+  transition,
+  type AccountSubtype,
+  type OrderEffect,
+  type OrderStatus,
+  type OrderTrigger,
+  type Poisha,
+  type PostingAccount,
+  type TransitionResult,
+  basisPointsAsPercent,
+  shortCollectionCeilingBps,
+  shortCollectionAllowed,
+} from '@elysium/domain';
+
+import type { AuditableRequest } from '../../platform/audit/audit.interceptor.js';
+import { AuditService } from '../../platform/audit/audit.service.js';
+import { emit } from '../../platform/events/outbox.js';
+import type { ActiveContext } from '../../platform/http/context.js';
+import { INVENTORY_API, type InventoryApi } from '../inventory/inventory.api.js';
+import { LEDGER_API, type LedgerApi } from '../ledger/ledger.api.js';
+import { CustomersService } from './customers.service.js';
+import * as repo from './orders.repository.js';
+import { OrdersError } from './orders.errors.js';
+import { AdvancesService } from './advances.service.js';
+import { OffersService } from './offers.service.js';
+import * as advancesRepo from './advances.repository.js';
+import { CourierBookingRegistry } from './ports/courier-booking.port.js';
+import { DeliveryObserverRegistry } from './ports/delivery-observer.port.js';
+import { ParcelObserverRegistry } from './ports/parcel-observer.port.js';
+import { deliveredNetItems, orderLevelDiscount } from './revenue.js';
+import { PROMO_PORT, type PromoPort } from './ports/promo.port.js';
+
+/**
+ * Performing a transition (architecture §9, invariant 7).
+ *
+ * The domain decides; this performs. `transition()` in `@elysium/domain` returns the new
+ * status and an ordered list of effects, and every one of them happens here, in the
+ * caller's transaction, before the status column moves. The order of the last two steps
+ * is deliberate: effects first, then the conditional `setStatus`. If an effect throws —
+ * no stock, a closed period, an idempotency conflict — the whole transaction rolls back
+ * and the order is still in the status it was, which is the only version of this that
+ * cannot leave an order confirmed with nothing reserved.
+ *
+ * ## Why every transition takes a row lock first
+ *
+ * `orderForUpdate` locks the order for the transaction. Without it, two agents pressing
+ * "confirm" and "cancel" both read `pending`, both pass the domain's check, and both
+ * perform their effects — a reservation and a release — before one of their UPDATEs
+ * loses. The conditional `setStatus` would catch the second *write*, but by then the
+ * first one's stock has already moved. The lock makes read-decide-write one unit, and
+ * the conditional UPDATE stays as the second lock (it catches a caller that bypassed
+ * this method, and migration 0041's trigger catches one that bypassed the service).
+ *
+ * ## The cost that everything downstream depends on
+ *
+ * `ship` is where `dispatch_unit_cost_poisha` is written on each line, and §7 requires it
+ * to be exactly what the dispatch movement recorded — delivery and return both credit
+ * goods in transit with it, and if the two figures differ the account never returns to
+ * zero. Inventory's API returns the *total* value it posted, not the per-line cost, so
+ * this reads the weighted average first, computes what the total should be, and refuses
+ * with `ORDER_COST_MOVED` if the total that came back disagrees. A disagreement means a
+ * receipt committed in between and moved the average; the retry reads the new one. The
+ * alternative — storing the average we read and hoping — is how goods in transit acquires
+ * a residue that nothing reports.
+ */
+
+/** The §7 accounts an order's journals name, resolved once per posting. */
+export type Accounts = ReadonlyMap<AccountSubtype, PostingAccount>;
+
+/**
+ * One account out of the resolved set.
+ *
+ * A function rather than `accounts.cogs!`: a non-null assertion here would be a promise
+ * that `accounts()` was called with the right subtypes, and the cost of breaking that
+ * promise is a journal posted with `undefined` as an account id — refused by the database
+ * with a message about a uuid, three layers from the mistake.
+ */
+function pick(accounts: Accounts, subtype: AccountSubtype): PostingAccount {
+  const account = accounts.get(subtype);
+  if (account === undefined) {
+    throw new OrdersError(
+      'LEDGER_ACCOUNT_NOT_FOUND',
+      `This posting needs the ${subtype} account, which was not resolved.`,
+    );
+  }
+  return account;
+}
+
+/**
+ * What the effects of one transition hand each other.
+ *
+ * `journalId` goes back out to the courier module, which writes it on the return receipt.
+ * `advanceAppliedPoisha` is what the delivery journal relieved Customer advance by, which
+ * `apply_advances` then spreads over the order's advances (D-233).
+ * `awaitingConsignment` is whether `enqueue_courier_booking` left a booking on its way, whose
+ * consignment the label waits for (D-914).
+ */
+interface Posted {
+  journalId: string | null;
+  advanceAppliedPoisha: bigint;
+  awaitingConsignment: boolean;
+}
+
+export interface DeliverOptions {
+  readonly collectedPoisha?: string | undefined;
+  readonly differenceReason?: string | undefined;
+  /**
+   * A person typed the collected amount (the order routes), so a shortfall needs a reason
+   * (M30, C5). The courier's own figure arrives without one, and its settlement is the
+   * check on it.
+   */
+  readonly shortfallNeedsReason?: true | undefined;
+  /** Set for a partial delivery: what actually arrived, per SKU. */
+  readonly lines?: readonly { readonly skuId: string; readonly deliveredQty: number }[] | undefined;
+  readonly occurredAt?: Date | undefined;
+}
+
+export interface ReturnOptions {
+  readonly reason: string;
+  readonly locationId?: string | undefined;
+  /**
+   * The whole parcel is damaged, for a caller with no inspection to report (the service-level
+   * tests; every person's receipt is the return station's inspection since D-1027).
+   *
+   * Kept for the caller that has no inspection to report — a box that came back soaked.
+   * It cannot express the ordinary case, which is why `receipt` exists.
+   */
+  readonly damaged?: boolean | undefined;
+  /**
+   * The warehouse's line-by-line inspection (§7, §8).
+   *
+   * §7 sends sellable and damaged units to *different* locations, so a single `damaged`
+   * flag cannot describe a box with one torn kurti in it: the whole parcel would go on the
+   * damaged shelf and three sellable kurtis would need a manual transfer, or the torn one
+   * would go back on the sellable shelf and be sold. With this, the return makes two sets
+   * of movements at one cost and posts one journal for the combined value.
+   */
+  readonly receipt?:
+    | {
+        readonly locationId: string;
+        readonly damagedLocationId: string | null;
+        readonly lines: readonly {
+          readonly skuId: string;
+          readonly sellableQty: number;
+          readonly damagedQty: number;
+        }[];
+      }
+    | undefined;
+  readonly occurredAt?: Date | undefined;
+}
+
+export interface MoveOptions {
+  readonly reason?: string | null;
+  /** Why the goods came back, from the fixed list: required on a return or an exchange (D-234). */
+  readonly returnReason?: string | null | undefined;
+  readonly occurredAt?: Date;
+  readonly courierId?: string | null;
+  readonly deliver?: DeliverOptions;
+  readonly ret?: ReturnOptions;
+  /** True when the caller performs `create_exchange_order` itself (see OrdersService). */
+  readonly callerHandlesExchange?: boolean;
+}
+
+@Injectable()
+export class TransitionsService {
+  private readonly logger = new Logger(TransitionsService.name);
+
+  constructor(
+    @Inject(INVENTORY_API) private readonly inventory: InventoryApi,
+    @Inject(LEDGER_API) private readonly ledger: LedgerApi,
+    @Inject(PROMO_PORT) private readonly promo: PromoPort,
+    private readonly customers: CustomersService,
+    private readonly audit: AuditService,
+    private readonly courier: CourierBookingRegistry,
+    private readonly deliveries: DeliveryObserverRegistry,
+    private readonly advances: AdvancesService,
+    private readonly offers: OffersService,
+    private readonly parcels: ParcelObserverRegistry,
+  ) {}
+
+  /**
+   * Move one order through `trigger`, performing §9's effects.
+   *
+   * Public because two callers need it: the controller's transition routes, and
+   * `OrdersService.exchange`, which has to create the replacement order itself and then
+   * move the original. Keeping `create_exchange_order` with the caller rather than here
+   * avoids a circular dependency between the two services, and the effect list is
+   * returned so the caller can assert it was asked to do that work rather than assume.
+   */
+  async move(
+    tx: Tx,
+    context: ActiveContext,
+    request: AuditableRequest,
+    order: repo.OrderRow,
+    trigger: OrderTrigger,
+    options: MoveOptions = {},
+  ): Promise<{ result: TransitionResult; order: repo.OrderRow; journalId: string | null }> {
+    const at = options.occurredAt ?? new Date();
+    /*
+     * §9's booking trigger, per org, read from `org.settings`.
+     *
+     * Read here rather than passed in by the caller, because the policy belongs to the
+     * *org* and not to the request: a confirm from the desk, from the portal and from a
+     * job all have to make the same parcel. An unset value is `on_confirm` (D-927): the
+     * owner wants every confirmed order sent to its courier for a consignment, and an order
+     * whose courier cannot be booked here confirms without one (D-901). Kept for the
+     * confirm's label below (D-914).
+     */
+    const bookingPolicy = await this.bookingPolicy(tx, context.orgId);
+    const result = transition({
+      from: order.status as OrderStatus,
+      trigger,
+      at,
+      reason: options.reason ?? null,
+      bookingPolicy,
+      /*
+       * Asked only on a cancel, because that is the only transition the domain filters on
+       * it: enqueueing a cancellation for a parcel that was never booked would hand a
+       * courier a consignment number that does not exist. Every other trigger would pay for
+       * a query whose answer it cannot use.
+       */
+      parcelBooked: trigger === 'cancel' && (await this.parcelBooked(tx, context.orgId, order.id)),
+      returnReason: options.returnReason ?? null,
+      // A website checkout reserved this order's stock as it was placed (D-532): the machine
+      // decides that its confirm reserves nothing more and a pending cancel releases.
+      stockHeld: order.stock_held_at !== null,
+    });
+
+    /*
+     * The journal an effect posted, carried back out of here.
+     *
+     * `applyTrigger` hands it to the courier module, which writes it onto the return
+     * receipt so the warehouse's receipt and §7's journal can be read off each other. A
+     * mutable holder rather than a return value from `perform`, because the effect list is
+     * a loop and only two of its effects post anything.
+     */
+    const posted: Posted = {
+      journalId: null,
+      advanceAppliedPoisha: 0n,
+      awaitingConsignment: false,
+    };
+
+    for (const effect of result.effects) {
+      await this.perform(tx, context, order, effect, result, options, posted);
+    }
+
+    const moved = await repo.setStatus(tx, {
+      orgId: context.orgId,
+      orderId: order.id,
+      expected: order.status,
+      next: result.to,
+      actorUserId: context.userId,
+      reason: result.reason,
+      at,
+    });
+    if (!moved) {
+      // The row moved between the lock and here, which the lock should have made
+      // impossible — so this is the backstop for a caller that reached `move` with a row
+      // it read without locking. Same code the domain and the trigger raise.
+      throw new OrdersError(
+        'ORDER_TRANSITION_INVALID',
+        'This order changed while the request was in flight; reload and try again.',
+      );
+    }
+
+    await repo.insertOrderEvent(tx, {
+      orgId: context.orgId,
+      orderId: order.id,
+      fromStatus: order.status,
+      toStatus: result.to,
+      trigger,
+      reason: result.reason,
+      actorUserId: context.userId,
+      businessDate: result.businessDate,
+      occurredAt: at,
+    });
+
+    await emit(
+      tx,
+      'order.status_changed',
+      {
+        id: order.id,
+        orderNo: order.order_no,
+        from: order.status,
+        to: result.to,
+        at: at.toISOString(),
+        resellerId: order.reseller_id,
+        branchId: order.branch_id,
+      },
+      { orgId: context.orgId },
+    );
+
+    await this.audit.record(tx, {
+      orgId: context.orgId,
+      actorUserId: context.userId,
+      operation: 'update',
+      action: `order.${trigger}`,
+      entityType: 'order',
+      entityId: order.id,
+      before: { status: order.status },
+      after: { status: result.to, reason: result.reason },
+      request,
+    });
+
+    /*
+     * M18: whoever registered for deliveries hears about this one in the same transaction
+     * (the marketing module enqueues its Conversions API event), so the event commits or
+     * rolls back with the delivery itself. Nothing registered is nothing to do (D-262).
+     */
+    if (result.to === 'delivered' || result.to === 'partially_delivered') {
+      await this.deliveries.notify(tx, {
+        orgId: context.orgId,
+        orderId: order.id,
+        status: result.to,
+        at,
+      });
+    }
+
+    /*
+     * D-914: a confirmed order is ready for its label now, whatever its courier. Packing keeps it
+     * in "Ready for label" and, unless a consignment is on its way, enqueues its automatic print —
+     * writes and an enqueue, never a call (invariant 6). A consignment is on its way when this
+     * confirm queued the booking, or when the brand books by hand and the order's courier can be
+     * booked here: the desk's Book now brings it, and the one automatic label carries it (a label
+     * printed now would stop that one, as a lot is printed automatically once). In a savepoint,
+     * as the courier's booking tells packing (ledger audit N5): the confirm is the business
+     * change, and a listener that fails loses only its own rows (the label is then printed by
+     * hand), never the confirm.
+     */
+    if (trigger === 'confirm' && result.to === 'confirmed' && !this.parcels.empty) {
+      try {
+        await tx.transaction(async (savepoint) =>
+          this.parcels.notifyConfirmed(savepoint, {
+            orgId: context.orgId,
+            orderId: order.id,
+            orderNo: order.order_no,
+            locationId: order.location_id,
+            awaitingConsignment:
+              posted.awaitingConsignment ||
+              (bookingPolicy === 'manual' &&
+                (await this.bookableByHand(savepoint, context.orgId, order.id))),
+            at,
+          }),
+        );
+      } catch (error) {
+        this.logger.warn(
+          `a confirmed order's label listeners failed for order ${order.id}: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
+
+    // M51 (D-938): an order received back ends its open return inspection, whichever route
+    // received it. In a savepoint, as above: the return is the business change.
+    if (trigger === 'receive_return' && result.to === 'returned' && !this.parcels.empty) {
+      try {
+        await tx.transaction(async (savepoint) =>
+          this.parcels.notifyReturned(savepoint, {
+            orgId: context.orgId,
+            orderId: order.id,
+            userId: context.userId,
+            at,
+          }),
+        );
+      } catch (error) {
+        this.logger.warn(
+          `a returned order's inspection did not close for order ${order.id}: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
+
+    // M41 (D-717): an order that left New is offered to nobody any more, whichever path moved
+    // it (the desk, a website payment, the marketplace, a courier), so no card outlives it.
+    if (order.status === 'pending') await this.offers.withdrawFor(tx, context.orgId, order.id);
+
+    const after = await repo.orderById(tx, context.orgId, order.id);
+    return { result, order: after ?? order, journalId: posted.journalId };
+  }
+
+  /** §9's booking trigger for this org, `on_confirm` until the brand chooses (D-927). */
+  private async bookingPolicy(tx: Tx, orgId: string): Promise<'on_confirm' | 'manual'> {
+    return repo.courierBookingSetting(tx, orgId);
+  }
+
+  /** Whether a parcel is live with a courier, asked of the module that owns the row. */
+  private async parcelBooked(tx: Tx, orgId: string, orderId: string): Promise<boolean> {
+    const courier = this.courier.current();
+    if (courier === undefined) return false;
+    return courier.hasLiveParcel(tx, orgId, orderId);
+  }
+
+  /**
+   * D-914, under booking by hand: whether a person's Book now will bring this order a
+   * consignment (its courier can be booked here, and no parcel is booked yet: a booked one's
+   * consignment is on the label's row already). An own rider's order answers no and prints on
+   * Confirm. Asked of the courier module, which owns the accounts.
+   */
+  private async bookableByHand(tx: Tx, orgId: string, orderId: string): Promise<boolean> {
+    const courier = this.courier.current();
+    if (courier?.canBook === undefined) return false;
+    if (!(await courier.canBook(tx, orgId, orderId))) return false;
+    return (await courier.parcelTracking(tx, orgId, orderId)) === null;
+  }
+
+  private async perform(
+    tx: Tx,
+    context: ActiveContext,
+    order: repo.OrderRow,
+    effect: OrderEffect,
+    result: TransitionResult,
+    options: MoveOptions,
+    posted: Posted,
+  ): Promise<void> {
+    const actor = { orgId: context.orgId, userId: context.userId };
+
+    switch (effect) {
+      case 'reserve_stock': {
+        const locationId = await this.locationFor(tx, context, order);
+        const lines = await repo.orderLines(tx, context.orgId, order.id);
+        // All or nothing across the lines: inventory throws `STOCK_INSUFFICIENT` naming
+        // the line that ran out, and the throw rolls back this transaction — which is
+        // what releases the lines already held. Acceptance check 2 (concurrent confirms
+        // never oversell) rests on inventory's conditional UPDATE, not on anything here.
+        await this.inventory.reserve(tx, actor, {
+          refType: 'order',
+          refId: order.id,
+          lines: lines.map((line) => ({ skuId: line.sku_id, locationId, qty: line.qty })),
+        });
+        return;
+      }
+
+      case 'release_reservation': {
+        await this.inventory.release(tx, actor, { refType: 'order', refId: order.id });
+        return;
+      }
+
+      case 'consume_reservation':
+        // Consumed by `inventory.dispatch` in the same call that creates the movements —
+        // the two cannot be separated without leaving units reserved for an order that
+        // has already gone out. Handled under `create_dispatch_movement`.
+        return;
+
+      case 'create_dispatch_movement':
+      case 'post_handover':
+        // Both are `inventory.dispatch`: the movements, the reservation settlement and
+        // §7's handover journal are one call because they have to be one transaction, and
+        // the average recorded on the movement is the value the journal posts. Performed
+        // once, on the first of the two effects.
+        if (effect === 'create_dispatch_movement') {
+          await this.dispatch(tx, context, order, options);
+          // The parcel left with the courier now (D-903): the clock for "not received" starts.
+          await this.courier
+            .current()
+            ?.recordHandover?.(
+              tx,
+              context.orgId,
+              order.id,
+              options.occurredAt ?? new Date(),
+              context.userId,
+            );
+        }
+        return;
+
+      case 'post_revenue':
+      case 'post_partial_revenue':
+        await this.postDelivery(
+          tx,
+          context,
+          order,
+          effect === 'post_partial_revenue',
+          options,
+          posted,
+        );
+        return;
+
+      case 'receive_return_stock':
+      case 'post_return':
+        if (effect === 'receive_return_stock')
+          await this.receiveReturn(tx, context, order, options, posted);
+        return;
+
+      case 'update_customer_stats':
+        await this.updateStats(tx, context, order, result);
+        return;
+
+      case 'apply_advances':
+        // After the delivery journal, which computed what it applied (D-233).
+        await this.advances.applyOnDelivery(tx, context.orgId, order, posted.advanceAppliedPoisha);
+        return;
+
+      case 'settle_advances':
+        // A cancel and a received return are the two endings (D-232).
+        await this.advances.settleOnEnding(
+          tx,
+          context,
+          order,
+          result.to === 'cancelled' ? 'cancel' : 'return',
+          options.occurredAt ?? new Date(),
+        );
+        return;
+
+      case 'record_return_reason': {
+        // The machine refused the move without a code, so one is here (D-234).
+        const code = result.returnReason;
+        if (code === null) throw new Error('a return was allowed without a reason code');
+        await advancesRepo.insertReturnReason(tx, {
+          orgId: context.orgId,
+          orderId: order.id,
+          kind: result.to === 'exchange' ? 'exchange' : 'return',
+          reasonCode: code,
+          note: result.reason,
+          businessDate: result.businessDate,
+          recordedBy: context.userId,
+        });
+        return;
+      }
+
+      case 'release_promo':
+        // The use goes back once however often the cancel arrives: conditional on the
+        // redemption still being applied (D-204). Nothing to do for an order with no code.
+        await this.promo.releaseForOrder(tx, context.orgId, order.id);
+        return;
+
+      case 'release_flash_units': {
+        // M35a, D-542: a cancel gives every flash unit back; a received return gives back
+        // each line's units that were not delivered (all of them after `return_in_transit`,
+        // the undelivered part after a partial delivery). Per order line, so two lines of
+        // one SKU priced by two sales each return their own (ledger audit W4). Once, by the
+        // claim rows' own conditional update; nothing to do for an order that claimed none.
+        const returned =
+          result.to === 'cancelled'
+            ? undefined
+            : (await repo.orderLines(tx, context.orgId, order.id)).map((line) => ({
+                orderLineId: line.id,
+                qty: line.qty - line.delivered_qty,
+              }));
+        await this.promo.releaseFlashUnits(tx, context.orgId, order.id, returned);
+        return;
+      }
+
+      case 'create_exchange_order':
+        if (options.callerHandlesExchange !== true) {
+          // A guard rather than a comment: if a future caller reaches the exchange
+          // transition through the ordinary transition route, the original order would
+          // be marked `exchange` with no replacement order in existence, and the
+          // customer's credit would sit in `customer_advance` with nothing pointing at it.
+          throw new OrdersError(
+            'ORDER_TRANSITION_INVALID',
+            'An exchange is raised through the exchange endpoint, which creates the replacement order.',
+          );
+        }
+        return;
+
+      case 'enqueue_courier_booking':
+      case 'enqueue_courier_cancel': {
+        /*
+         * Both are enqueues, never courier calls (invariant 6).
+         *
+         * `reserveConsignment` writes the consignment row and the pg-boss job *through this
+         * transaction*, so the parcel is queued if and only if the status change commits: an
+         * order that rolled back has no parcel queued, and one that committed has exactly
+         * one. The courier call itself happens in the worker, where no transaction is open.
+         */
+        const courier = this.courier.current();
+        if (courier === undefined) {
+          // The org's policy says book, and there is nothing to book with. Refusing rolls
+          // the transition back, which beats a confirmed order that the desk believes has a
+          // parcel and that no courier has ever heard of.
+          throw new OrdersError(
+            'ORDER_TRANSITION_INVALID',
+            'This deployment has no courier module registered, so a parcel cannot be queued.',
+          );
+        }
+        if (effect === 'enqueue_courier_booking') {
+          const reserved = await courier.reserveConsignment(tx, actor, {
+            orderId: order.id,
+            courierId: options.courierId ?? order.courier_id,
+            // The brand's setting asks (D-901): an own rider's order is not refused for it.
+            automatic: true,
+          });
+          // D-914: a consignment will come back only for a parcel now queued and not yet booked
+          // (null: nothing could be booked here, an own rider's order, say).
+          posted.awaitingConsignment =
+            reserved !== null &&
+            (await courier.parcelTracking(tx, context.orgId, order.id)) === null;
+          return;
+        }
+        await courier.cancelConsignment(tx, actor, order.id);
+        return;
+      }
+
+      default: {
+        /*
+         * `effect` is `never` here while every effect the domain declares has a case. One
+         * added to the state machine without a handler stops compiling, where before it
+         * compiled and silently did nothing on every transition that named it — which is
+         * how `release_promo` would have gone missing.
+         */
+        const unhandled: never = effect;
+        throw new Error(
+          `The order state machine declared an effect with no handler: ${String(unhandled)}`,
+        );
+      }
+    }
+  }
+
+  // --- the effects, in full ----------------------------------------------------
+
+  private async dispatch(
+    tx: Tx,
+    context: ActiveContext,
+    order: repo.OrderRow,
+    options: MoveOptions,
+  ): Promise<void> {
+    const actor = { orgId: context.orgId, userId: context.userId };
+    const locationId = await this.locationFor(tx, context, order);
+    const lines = await repo.orderLines(tx, context.orgId, order.id);
+    const occurredAt = options.occurredAt ?? new Date();
+
+    /*
+     * The average now, so the per-line cost can be written down.
+     *
+     * Read before the dispatch and checked against the total the dispatch reports. A
+     * concurrent receipt that moved the average between the two makes the totals
+     * disagree, and the request is refused as retryable rather than storing a figure no
+     * movement records — which would put the delivery journal and the handover journal
+     * on different numbers and leave goods in transit permanently non-zero.
+     */
+    const costs = await this.inventory.costFor(
+      tx,
+      context.orgId,
+      lines.map((line) => line.sku_id),
+    );
+    const expected = lines.reduce(
+      (total, line) => total + BigInt(costs.get(line.sku_id) ?? 0n) * BigInt(line.qty),
+      0n,
+    );
+
+    const posted = await this.inventory.dispatch(tx, actor, {
+      orderId: order.id,
+      locationId,
+      branchId: order.branch_id,
+      occurredAt,
+      lines: lines.map((line) => ({ skuId: line.sku_id, qty: line.qty })),
+      fromReservation: true,
+      memo: `Order ${order.order_no}`,
+    });
+
+    if (BigInt(posted.valuePoisha) !== expected) {
+      throw new OrdersError(
+        'ORDER_COST_MOVED',
+        'A stock receipt changed the cost of these units while the handover was being recorded; try again.',
+      );
+    }
+
+    for (const line of lines) {
+      await repo.setLineDispatchCost(tx, {
+        orgId: context.orgId,
+        orderId: order.id,
+        skuId: line.sku_id,
+        unitCostPoisha: BigInt(costs.get(line.sku_id) ?? 0n),
+      });
+    }
+  }
+
+  private async postDelivery(
+    tx: Tx,
+    context: ActiveContext,
+    order: repo.OrderRow,
+    partial: boolean,
+    options: MoveOptions,
+    posted: Posted,
+  ): Promise<void> {
+    const occurredAt = options.occurredAt ?? new Date();
+    const lines = await repo.orderLines(tx, context.orgId, order.id);
+    const reported = new Map(
+      (options.deliver?.lines ?? []).map((line) => [line.skuId, line.deliveredQty]),
+    );
+
+    // A full delivery delivers every remaining unit; a partial one delivers what the
+    // courier reported, and anything not reported is treated as not delivered.
+    const deliveredFor = (line: repo.OrderLineRow): number =>
+      partial ? (reported.get(line.sku_id) ?? 0) : line.qty - line.returned_qty;
+
+    const split = computePartialDelivery({
+      lines: lines.map((line) => ({
+        qty: line.qty,
+        unitPricePoisha: poisha(BigInt(line.unit_price_poisha)),
+        lineDiscountPoisha: poisha(BigInt(line.discount_poisha)),
+        deliveredQty: deliveredFor(line),
+      })),
+      // The order-level discount only. Line discounts are already on the lines, and
+      // adding them twice is how an order's revenue comes out short by exactly its
+      // discount.
+      orderDiscountPoisha: poisha(this.orderLevelDiscount(order, lines)),
+      deliveryChargePoisha: poisha(BigInt(order.delivery_charge_poisha)),
+    });
+
+    const costPoisha = dispatchValue(
+      lines.map((line) => ({
+        qty: deliveredFor(line),
+        unitCostPoisha: poisha(BigInt(line.dispatch_unit_cost_poisha ?? '0')),
+      })),
+    );
+
+    /*
+     * Only the delivered share of the advance is applied.
+     *
+     * Applying the whole prepayment was wrong in both directions on a partial delivery.
+     * `earned` is the delivered lines plus the delivery charge, so when the advance
+     * exceeded it the difference fell through `orderDeliveredDraft`'s short/over branch
+     * and was **credited to Sales discounts** — extinguishing a liability the brand still
+     * owed and recognising the buyer's own money as income, with the trial balance still
+     * at zero and no report able to show it. The other branch was no better: with the
+     * collected amount left out, the default below went negative and the transition was
+     * refused outright, so a mostly-prepaid parcel that arrived in part could not be
+     * recorded correctly at all.
+     *
+     * `applicableAdvance` is the rule the exchange flow already used for exactly this
+     * question. What is left over stays in `customer_advance`, which is what it is: a
+     * store credit the brand owes, spendable on a reshipment or refundable.
+     */
+    const { appliedPoisha: advanceAppliedPoisha } = applicableAdvance({
+      netItemsPoisha: split.deliveredNetItemsPoisha,
+      deliveryChargePoisha: poisha(BigInt(order.delivery_charge_poisha)),
+      creditPoisha: poisha(BigInt(order.advance_paid_poisha)),
+    });
+    const advanceApplied = BigInt(advanceAppliedPoisha);
+    const collected =
+      options.deliver?.collectedPoisha === undefined
+        ? // Nothing reported: assume the rider collected what the order says, which is
+          // the ordinary case and keeps the Sales discounts line off the journal.
+          BigInt(split.expectedCollectionPoisha) - advanceApplied
+        : BigInt(options.deliver.collectedPoisha);
+    if (collected < 0n) {
+      throw new OrdersError(
+        'ORDER_TOTAL_INVALID',
+        'A rider cannot collect a negative amount; record a refund instead.',
+      );
+    }
+    /*
+     * Less than the order's cash on delivery goes to Sales discounts (§7), and nothing
+     * bounded a person's say-so: an agent marking their own order delivered at ৳0 moved its
+     * revenue into discounts with no word of why (security review C5). A reason is now
+     * required, so the shortfall carries an explanation into the journal's memo and the
+     * audit log, where accounts and the settlement match will see it.
+     */
+    const expected = BigInt(split.expectedCollectionPoisha) - advanceApplied;
+    if (
+      options.deliver?.shortfallNeedsReason === true &&
+      collected < expected &&
+      (options.deliver.differenceReason ?? '').trim() === ''
+    ) {
+      throw new OrdersError(
+        'ORDER_REASON_REQUIRED',
+        'The rider collected less than the cash on delivery. Say why in the difference reason.',
+      );
+    }
+    if (
+      options.deliver?.shortfallNeedsReason === true &&
+      !shortCollectionAllowed({
+        expectedPoisha: expected,
+        collectedPoisha: collected,
+        ceilingBps: shortCollectionCeilingBps(context),
+      })
+    ) {
+      throw new OrdersError(
+        'ORDER_DISCOUNT_ABOVE_CEILING',
+        `That is more short than your role may write off (${basisPointsAsPercent(shortCollectionCeilingBps(context))}% of the cash on delivery). ` +
+          'An org admin records it.',
+      );
+    }
+
+    const courierId = await this.courierFor(tx, context, order, options);
+    const accounts = await this.accounts(tx, context.orgId, [
+      'courier_receivable',
+      'sales_revenue',
+      'delivery_charge_income',
+      'cogs',
+      'goods_in_transit',
+      'customer_advance',
+      'sales_discounts',
+    ]);
+
+    const journal = await this.ledger.post(
+      tx,
+      { orgId: context.orgId, userId: context.userId },
+      orderDeliveredDraft({
+        orderId: order.id,
+        occurredAt,
+        partial,
+        courierReceivable: pick(accounts, 'courier_receivable'),
+        courierId,
+        salesRevenue: pick(accounts, 'sales_revenue'),
+        deliveryIncome: pick(accounts, 'delivery_charge_income'),
+        cogs: pick(accounts, 'cogs'),
+        goodsInTransit: pick(accounts, 'goods_in_transit'),
+        customerAdvance: pick(accounts, 'customer_advance'),
+        salesDiscounts: pick(accounts, 'sales_discounts'),
+        netItemsPoisha: split.deliveredNetItemsPoisha,
+        deliveryChargePoisha: poisha(BigInt(order.delivery_charge_poisha)),
+        advanceAppliedPoisha: poisha(advanceApplied),
+        collectedPoisha: poisha(collected),
+        costPoisha,
+        differenceReason: options.deliver?.differenceReason ?? null,
+        branchId: order.branch_id,
+        memo: `Order ${order.order_no}`,
+      }),
+    );
+
+    posted.journalId = journal.journalId;
+    posted.advanceAppliedPoisha = advanceApplied;
+
+    for (const line of lines) {
+      await repo.setLineFulfilment(tx, {
+        orgId: context.orgId,
+        orderId: order.id,
+        skuId: line.sku_id,
+        deliveredQty: deliveredFor(line),
+      });
+    }
+  }
+
+  private async receiveReturn(
+    tx: Tx,
+    context: ActiveContext,
+    order: repo.OrderRow,
+    options: MoveOptions,
+    posted: Posted,
+  ): Promise<void> {
+    const occurredAt = options.occurredAt ?? new Date();
+    const lines = await repo.orderLines(tx, context.orgId, order.id);
+    // D-1028: a courier's partial names no pieces, so on a partly delivered order the pieces
+    // counted as kept may be in the parcel too.
+    const partly = order.status === 'partially_delivered';
+    const counts = lines.map((line) => ({
+      skuId: line.sku_id,
+      qty: line.qty,
+      deliveredQty: line.delivered_qty,
+      returnedQty: line.returned_qty,
+    }));
+    const outstanding = new Map(counts.map((line) => [line.skuId, stillOutQty(line)]));
+    const limits = new Map(counts.map((line) => [line.skuId, returnableQty(line, partly)]));
+    const costs = new Map(
+      lines.map((line) => [line.sku_id, poisha(BigInt(line.dispatch_unit_cost_poisha ?? '0'))]),
+    );
+
+    /*
+     * One receipt, two destinations (§7, §8).
+     *
+     * A parcel that comes back is inspected unit by unit, and §7 sends the sellable units to
+     * the shelf they were picked from and the damaged ones to the `damaged` location. So the
+     * movements are made in **two batches at one cost** rather than one batch at a location
+     * chosen by a flag: a box with three sellable kurtis and one torn one cannot be described
+     * by a boolean, and describing it wrongly either sells a torn garment or sends three good
+     * ones to a shelf they need a manual transfer to leave.
+     *
+     * Both batches value their units at `dispatch_unit_cost_poisha`, which is what the
+     * dispatch movement recorded. The journal below is one journal for their combined value,
+     * because §7's return rule is `Dr Inventory / Cr Goods in transit` and the chart has one
+     * inventory account — the damaged shelf is inside it. Writing damaged units *off* is a
+     * separate step that needs approval (M07's `stockAdjustmentDraft`), and that separation is
+     * the control: a return that could write off in one step would be a way to make stock
+     * disappear without one.
+     */
+    const batches = await this.returnBatches(
+      tx,
+      context,
+      order,
+      options,
+      outstanding,
+      limits,
+      costs,
+    );
+    const usable = batches.filter((batch) => batch.lines.length > 0);
+
+    if (usable.length === 0) {
+      throw new OrdersError(
+        'ORDER_LINES_INVALID',
+        'Every unit on this order is already accounted for.',
+      );
+    }
+
+    const back = new Map<string, number>();
+    for (const batch of usable) {
+      for (const line of batch.lines) {
+        back.set(line.skuId, (back.get(line.skuId) ?? 0) + line.qty);
+      }
+    }
+    // Each piece back is one still with the courier or one counted as kept, and each piece still
+    // with the courier that is not here is missing (D-1028 to D-1030).
+    let split: ReturnType<typeof splitReturn>;
+    try {
+      split = splitReturn({ lines: counts, partlyDelivered: partly, back });
+    } catch (error) {
+      throw new OrdersError(
+        'ORDER_LINES_INVALID',
+        error instanceof Error ? error.message : 'Those pieces do not fit this order.',
+      );
+    }
+    const valueOf = (pick: (entry: (typeof split)[number]) => number): bigint =>
+      BigInt(
+        dispatchValue(
+          split.map((entry) => ({
+            qty: pick(entry),
+            unitCostPoisha: costs.get(entry.skuId) ?? poisha(0n),
+          })),
+        ),
+      );
+
+    let receivedValue = 0n;
+    for (const batch of usable) {
+      const received = await this.inventory.receiveCustomerReturn(
+        tx,
+        { orgId: context.orgId, userId: context.userId },
+        {
+          orderId: order.id,
+          locationId: batch.locationId,
+          occurredAt,
+          lines: batch.lines,
+          memo: `Order ${order.order_no} return (${batch.condition})`,
+        },
+      );
+      receivedValue += BigInt(received.valuePoisha);
+    }
+    // What the shelves took is what the journals below post, or 1300 and 1310 stop agreeing.
+    if (
+      receivedValue !==
+      valueOf((entry) => entry.fromTransit) + valueOf((entry) => entry.fromDelivered)
+    ) {
+      throw new OrdersError(
+        'ORDER_COST_MOVED',
+        'The returned pieces were valued differently from their dispatch; try again.',
+      );
+    }
+
+    // §7's return journal is `Dr Inventory / Cr Goods in transit` at the dispatch value, for the
+    // pieces that were still with the courier. Inventory records the movements and leaves the
+    // journal to whoever knows whether the parcel was refused, partly delivered or sent back.
+    const transitValue = valueOf((entry) => entry.fromTransit);
+    if (transitValue > 0n) {
+      const accounts = await this.accounts(tx, context.orgId, ['inventory', 'goods_in_transit']);
+      const journal = await this.ledger.post(
+        tx,
+        { orgId: context.orgId, userId: context.userId },
+        orderReturnDraft({
+          orderId: order.id,
+          occurredAt,
+          inventory: pick(accounts, 'inventory'),
+          goodsInTransit: pick(accounts, 'goods_in_transit'),
+          valuePoisha: poisha(transitValue),
+          branchId: order.branch_id,
+          memo: `Order ${order.order_no} return`,
+        }),
+      );
+      posted.journalId = journal.journalId;
+    }
+
+    // D-1028: pieces the delivery counted as kept came back; the delivery was worth less.
+    if (split.some((entry) => entry.fromDelivered > 0)) {
+      const journalId = await this.takeBackDelivered(tx, context, order, lines, split, {
+        occurredAt,
+        costPoisha: valueOf((entry) => entry.fromDelivered),
+      });
+      posted.journalId ??= journalId;
+    }
+
+    // D-1030: pieces still with the courier and not in the parcel are a claim on the courier. A
+    // receipt that has no inspection sends every outstanding piece back, so it has none missing.
+    const missingValue = valueOf((entry) => entry.missing);
+    if (options.ret?.receipt !== undefined && missingValue > 0n) {
+      const codeOf = new Map(lines.map((line) => [line.sku_id, line.sku_code]));
+      // Other receivables carries no party, so the claim's courier is named in its memo.
+      const courier =
+        order.courier_id === null
+          ? undefined
+          : (await repo.couriersByIds(tx, context.orgId, [order.courier_id]))[0];
+      const missing = split
+        .filter((entry) => entry.missing > 0)
+        .map((entry) => `${String(entry.missing)} × ${codeOf.get(entry.skuId) ?? entry.skuId}`)
+        .join(', ');
+      const accounts = await this.accounts(tx, context.orgId, [
+        'other_receivable',
+        'goods_in_transit',
+      ]);
+      const journal = await this.ledger.post(
+        tx,
+        { orgId: context.orgId, userId: context.userId },
+        returnShortDraft({
+          orderId: order.id,
+          occurredAt,
+          otherReceivable: pick(accounts, 'other_receivable'),
+          goodsInTransit: pick(accounts, 'goods_in_transit'),
+          valuePoisha: poisha(missingValue),
+          branchId: order.branch_id,
+          memo: `Order ${order.order_no}${courier === undefined ? '' : ` (${courier.name})`}: not in the returned parcel: ${missing}`.slice(
+            0,
+            500,
+          ),
+        }),
+      );
+      posted.journalId ??= journal.journalId;
+    }
+
+    for (const entry of split) {
+      const line = lines.find((candidate) => candidate.sku_id === entry.skuId);
+      const got = entry.fromTransit + entry.fromDelivered;
+      if (line === undefined || got === 0) continue;
+      await repo.setLineFulfilment(tx, {
+        orgId: context.orgId,
+        orderId: order.id,
+        skuId: line.sku_id,
+        returnedQty: line.returned_qty + got,
+        ...(entry.fromDelivered > 0
+          ? { deliveredQty: line.delivered_qty - entry.fromDelivered }
+          : {}),
+      });
+    }
+  }
+
+  /**
+   * Pieces a partly delivered order counted as kept that came back (D-1028): the sale of them is
+   * taken back at the value the delivery journal gave it, the advance the smaller delivery no
+   * longer uses is owed to the buyer, the pieces' cost leaves COGS for the shelf, and the buyer's
+   * lifetime value falls by the same net value. The courier's collected figure is untouched.
+   * Returns the journal's id, or null when the pieces carried no price and no cost.
+   */
+  private async takeBackDelivered(
+    tx: Tx,
+    context: ActiveContext,
+    order: repo.OrderRow,
+    lines: readonly repo.OrderLineRow[],
+    split: ReturnType<typeof splitReturn>,
+    input: { readonly occurredAt: Date; readonly costPoisha: bigint },
+  ): Promise<string | null> {
+    const fromDelivered = new Map(split.map((entry) => [entry.skuId, entry.fromDelivered]));
+    const amounts = partialReturnAmounts({
+      lines: lines.map((line) => ({
+        qty: line.qty,
+        unitPricePoisha: poisha(BigInt(line.unit_price_poisha)),
+        lineDiscountPoisha: poisha(BigInt(line.discount_poisha)),
+        deliveredBefore: line.delivered_qty,
+        deliveredAfter: line.delivered_qty - (fromDelivered.get(line.sku_id) ?? 0),
+      })),
+      orderDiscountPoisha: poisha(this.orderLevelDiscount(order, lines)),
+      deliveryChargePoisha: poisha(BigInt(order.delivery_charge_poisha)),
+      advancePoisha: poisha(BigInt(order.advance_paid_poisha)),
+    });
+    const revenue = BigInt(amounts.netBeforePoisha) - BigInt(amounts.netAfterPoisha);
+    if (revenue !== 0n) {
+      await this.customers.applyStats(tx, context.orgId, order.customer_id, {
+        ltvPoisha: -revenue,
+      });
+    }
+    if (revenue === 0n && amounts.advanceReleasedPoisha === 0n && input.costPoisha === 0n) {
+      return null;
+    }
+    const accounts = await this.accounts(tx, context.orgId, [
+      'sales_revenue',
+      'sales_discounts',
+      'inventory',
+      'cogs',
+      ...(amounts.advanceReleasedPoisha > 0n ? (['other_payable'] as const) : []),
+    ]);
+    const journal = await this.ledger.post(
+      tx,
+      { orgId: context.orgId, userId: context.userId },
+      orderPartialReturnDraft({
+        orderId: order.id,
+        occurredAt: input.occurredAt,
+        salesRevenue: pick(accounts, 'sales_revenue'),
+        salesDiscounts: pick(accounts, 'sales_discounts'),
+        inventory: pick(accounts, 'inventory'),
+        cogs: pick(accounts, 'cogs'),
+        otherPayable:
+          amounts.advanceReleasedPoisha > 0n ? pick(accounts, 'other_payable') : undefined,
+        netBeforePoisha: amounts.netBeforePoisha,
+        netAfterPoisha: amounts.netAfterPoisha,
+        advanceReleasedPoisha: amounts.advanceReleasedPoisha,
+        costPoisha: poisha(input.costPoisha),
+        branchId: order.branch_id,
+        memo: `Order ${order.order_no}: pieces of a partial delivery came back`,
+      }),
+    );
+    return journal.journalId;
+  }
+
+  /**
+   * The movements a return makes, grouped by the location they land in.
+   *
+   * Two shapes of caller, one set of batches. The courier module and the warehouse screen
+   * send `receipt` — an inspection, per SKU, split into sellable and damaged. A caller with no
+   * inspection (the service-level tests) sends every outstanding unit to one place,
+   * optionally the damaged shelf. Both end up here so there is exactly one place that
+   * decides how many units of what cost go where.
+   */
+  private async returnBatches(
+    tx: Tx,
+    context: ActiveContext,
+    order: repo.OrderRow,
+    options: MoveOptions,
+    outstanding: ReadonlyMap<string, number>,
+    /** The most of each SKU that may come back (D-1028); what is outstanding but on a partial. */
+    limits: ReadonlyMap<string, number>,
+    costs: ReadonlyMap<string, Poisha>,
+  ): Promise<
+    readonly {
+      readonly condition: 'sellable' | 'damaged';
+      readonly locationId: string;
+      readonly lines: readonly { skuId: string; qty: number; dispatchUnitCostPoisha: Poisha }[];
+    }[]
+  > {
+    const receipt = options.ret?.receipt;
+
+    if (receipt === undefined) {
+      const locationId =
+        options.ret?.damaged === true
+          ? await this.damagedLocation(tx, context)
+          : (options.ret?.locationId ?? (await this.locationFor(tx, context, order)));
+      const lines = [...outstanding]
+        .filter(([, qty]) => qty > 0)
+        .map(([skuId, qty]) => ({
+          skuId,
+          qty,
+          dispatchUnitCostPoisha: costs.get(skuId) ?? poisha(0n),
+        }));
+      return [
+        { condition: options.ret?.damaged === true ? 'damaged' : 'sellable', locationId, lines },
+      ];
+    }
+
+    for (const line of receipt.lines) {
+      const limit = limits.get(line.skuId);
+      if (limit === undefined || line.sellableQty + line.damagedQty > limit) {
+        /*
+         * More back than went out, refused rather than clamped.
+         *
+         * Checked here as well as in the module that took the inspection, because this is
+         * the module that would create the units: clamping would put stock on a shelf that
+         * no dispatch ever took off one, and the inventory reconciliation would report the
+         * symptom weeks later with nothing to trace it to.
+         */
+        throw new OrdersError(
+          'ORDER_LINES_INVALID',
+          'More units came back for one SKU than may come back on this order.',
+        );
+      }
+    }
+
+    const damagedQty = receipt.lines.reduce((total, line) => total + line.damagedQty, 0);
+    const damagedLocationId =
+      damagedQty === 0
+        ? null
+        : (receipt.damagedLocationId ?? (await this.damagedLocation(tx, context)));
+
+    const batches: {
+      condition: 'sellable' | 'damaged';
+      locationId: string;
+      lines: { skuId: string; qty: number; dispatchUnitCostPoisha: Poisha }[];
+    }[] = [
+      { condition: 'sellable', locationId: receipt.locationId, lines: [] },
+      ...(damagedLocationId === null
+        ? []
+        : [{ condition: 'damaged' as const, locationId: damagedLocationId, lines: [] }]),
+    ];
+
+    for (const line of receipt.lines) {
+      const unitCost = costs.get(line.skuId) ?? poisha(0n);
+      if (line.sellableQty > 0) {
+        batches[0]?.lines.push({
+          skuId: line.skuId,
+          qty: line.sellableQty,
+          dispatchUnitCostPoisha: unitCost,
+        });
+      }
+      if (line.damagedQty > 0) {
+        batches[1]?.lines.push({
+          skuId: line.skuId,
+          qty: line.damagedQty,
+          dispatchUnitCostPoisha: unitCost,
+        });
+      }
+    }
+
+    return batches;
+  }
+
+  /** The brand's damaged shelf, or a refusal naming what is missing (§7). */
+  private async damagedLocation(tx: Tx, context: ActiveContext): Promise<string> {
+    const damaged = await repo.damagedLocation(tx, context.orgId);
+    if (damaged === undefined) {
+      throw new OrdersError(
+        'STOCK_LOCATION_INVALID',
+        'This brand has no damaged-stock location; create one before receiving damaged returns.',
+      );
+    }
+    return damaged.id;
+  }
+
+  private async updateStats(
+    tx: Tx,
+    context: ActiveContext,
+    order: repo.OrderRow,
+    result: TransitionResult,
+  ): Promise<void> {
+    /*
+     * Three of §9's eleven statuses move a buyer's counters, and the rest move nothing.
+     *
+     * Written as guards rather than a `switch` with a `default`, because the machine only
+     * ever produces this effect on those three rows — a `default: return` would be a branch
+     * that looks like it handles the other eight and in fact can never run, which is the
+     * kind of dead code a reader spends time on.
+     */
+    if (result.to === 'delivered' || result.to === 'partially_delivered') {
+      /*
+       * LTV moves by net revenue recognised, which for a partial delivery is the
+       * delivered part only — anything else would count a return as a purchase.
+       *
+       * Through `computePartialDelivery`, which is the same function the journal used, so
+       * the two cannot disagree. Summing it here by hand was wrong twice: it ignored the
+       * **order-level** discount entirely, so a ৳1,000 order with a ৳200 promo added
+       * ৳1,000 to lifetime value while ৳800 of revenue was recognised; and on a partial
+       * delivery it subtracted the whole line discount from the delivered units alone,
+       * understating the rest. It was also arithmetic outside `packages/domain`, which
+       * invariant 11 exists to prevent — and this figure feeds §10's trust score, so a
+       * buyer's own history was being scored against a number the ledger never agreed
+       * with.
+       */
+      const lines = await repo.orderLines(tx, context.orgId, order.id);
+      const net = BigInt(deliveredNetItems(order, lines));
+      await this.customers.applyStats(tx, context.orgId, order.customer_id, {
+        delivered: 1,
+        ltvPoisha: net > 0n ? net : 0n,
+        orderedAt: order.created_at,
+      });
+      return;
+    }
+    if (result.to === 'returned') {
+      await this.customers.applyStats(tx, context.orgId, order.customer_id, { returned: 1 });
+      return;
+    }
+    if (result.to === 'cancelled') {
+      await this.customers.applyStats(tx, context.orgId, order.customer_id, { cancelled: 1 });
+    }
+  }
+
+  // --- resolving the things a posting needs ------------------------------------
+
+  /**
+   * The order-level discount: the order's total discount minus what the lines carry.
+   *
+   * Derived rather than stored separately because `orders.discount_poisha` is what §9
+   * names and what the COD CHECK re-derives from. Splitting it into two columns would
+   * give two numbers that must agree, and the one the reports read would be whichever
+   * the last migration touched.
+   */
+  private orderLevelDiscount(order: repo.OrderRow, lines: readonly repo.OrderLineRow[]): bigint {
+    return orderLevelDiscount(order, lines);
+  }
+
+  async locationFor(tx: Tx, context: ActiveContext, order: repo.OrderRow): Promise<string> {
+    if (order.location_id !== null) return order.location_id;
+    const fallback = await repo.defaultFulfilmentLocation(tx, context.orgId, order.branch_id);
+    if (fallback === undefined) {
+      throw new OrdersError(
+        'STOCK_LOCATION_INVALID',
+        'This brand has no warehouse to fulfil from; create one first.',
+      );
+    }
+    return fallback.id;
+  }
+
+  /**
+   * Refuse to name a different courier once a parcel is with one.
+   *
+   * §7's delivery journal debits `courier_receivable` against the order's courier, and a
+   * settlement relieves it against the *consignment's* courier. While they are the same
+   * party the receivable clears to zero. Let the order move to another courier after the
+   * parcel is booked and the debit lands on one courier and the credit on another: the
+   * first is owed money it never collected, the second has a balance that never clears,
+   * and the org's total still agrees — so the trial balance is no help and the only
+   * symptom is two reconciliation variances nobody can pair up (M15's ledger audit).
+   *
+   * A live parcel is a pending or booked consignment. To change courier, cancel that
+   * booking first; then there is no parcel and this allows it.
+   */
+  async assertCourierChangeAllowed(
+    tx: Tx,
+    orgId: string,
+    order: Pick<repo.OrderRow, 'id' | 'courier_id'>,
+    nextCourierId: string | null | undefined,
+  ): Promise<void> {
+    if (nextCourierId === null || nextCourierId === undefined) return;
+    if (nextCourierId === order.courier_id) return;
+    const courier = this.courier.current();
+    if (courier === undefined) return;
+    if (await courier.hasLiveParcel(tx, orgId, order.id)) {
+      throw new OrdersError(
+        'ORDER_IMMUTABLE',
+        'This order already has a parcel booked with its courier. Cancel that booking before choosing another courier.',
+      );
+    }
+  }
+
+  /**
+   * Refuse a delivery or a received return recorded on the order while its parcel is live
+   * with a courier (ledger audit of D-392, W2).
+   *
+   * The order routes post §7's journals and never touch the consignment, so a delivery
+   * marked here left the parcel's `collected_poisha` empty: the courier's own "delivered"
+   * then found the order delivered and recorded nothing, and every such parcel became an
+   * amount mismatch on the courier's statement, its receivable never cleared by matching.
+   * A return received here sat in the courier's "awaiting return" list for good. The parcel
+   * routes (`POST /v1/courier/parcels/:id/status` and `…/receive-return`) take the same
+   * moves through `applyTrigger` and write the consignment too, so the order is pointed
+   * there. Pending counts as live, as it does for a cancel (`hasLiveParcel`).
+   */
+  async assertNoLiveParcel(tx: Tx, orgId: string, orderId: string): Promise<void> {
+    const courier = this.courier.current();
+    if (courier === undefined) return;
+    if (await courier.hasLiveParcel(tx, orgId, orderId)) {
+      throw new OrdersError(
+        'ORDER_TRANSITION_INVALID',
+        'This order has a parcel with the courier. Record the delivery or the return on the parcel, so the courier’s figure and its statement agree.',
+      );
+    }
+  }
+
+  private async courierFor(
+    tx: Tx,
+    context: ActiveContext,
+    order: repo.OrderRow,
+    options: MoveOptions,
+  ): Promise<string> {
+    // Every posting that names a courier party comes through here, so this is the one
+    // place the rule cannot be walked around by a transition that takes `courierId`.
+    await this.assertCourierChangeAllowed(tx, context.orgId, order, options.courierId);
+    const named = options.courierId ?? order.courier_id;
+    if (named !== null && named !== undefined) return named;
+    // §9's default (the order's zone's, else the brand's), never whichever party sorts first.
+    const fallback = await repo.deliveryFallbackCourier(tx, context.orgId, order.delivery_zone_id);
+    if (fallback === undefined) {
+      // §7's courier receivable is a party subtype: the balance is per courier or it is
+      // meaningless. Refusing beats posting the delivery against a nameless party, or one
+      // that never carried the parcel, which is a receivable nobody can reconcile.
+      throw new OrdersError(
+        'DELIVERY_ZONE_NOT_FOUND',
+        'This order names no courier and the brand has no default courier to post its delivery against. Give the order its courier, then record the delivery.',
+      );
+    }
+    return fallback;
+  }
+
+  /** The §7 accounts, by subtype, or a clear refusal naming the missing one. */
+  private async accounts(
+    tx: Tx,
+    orgId: string,
+    subtypes: readonly AccountSubtype[],
+  ): Promise<Accounts> {
+    const found = new Map<AccountSubtype, PostingAccount>();
+    for (const subtype of subtypes) {
+      const row = await repo.accountBySubtype(tx, orgId, subtype);
+      if (row === undefined) {
+        // Seeded by the chart-of-accounts template (D-084). Missing means the chart is
+        // broken, and saying so beats posting the value somewhere else.
+        throw new OrdersError(
+          'LEDGER_ACCOUNT_NOT_FOUND',
+          `This organization has no ${subtype} account.`,
+        );
+      }
+      found.set(subtype, { accountId: row.id, subtype, branchId: row.branch_id });
+    }
+    return found;
+  }
+
+  /** Exposed for the exchange flow, which needs the same accounts. */
+  async accountsFor(tx: Tx, orgId: string, subtypes: readonly AccountSubtype[]): Promise<Accounts> {
+    return this.accounts(tx, orgId, subtypes);
+  }
+}

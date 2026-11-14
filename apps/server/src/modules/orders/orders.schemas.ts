@@ -1,0 +1,703 @@
+import { ORDER_CHANNELS } from '@elysium/contracts';
+import { customerDetailsSchema } from '@elysium/contracts/customers';
+import {
+  ADVANCE_METHODS,
+  ADVANCE_STATUSES,
+  BUYER_CHECKS,
+  PHONE_RELATIONS,
+  PLACED_FOR,
+  RETURN_REASON_CODES,
+} from '@elysium/domain';
+import { RFM_SEGMENTS } from '@elysium/domain/crm';
+import { z } from 'zod';
+
+/**
+ * What the order endpoints accept (architecture §23; validate at the edge).
+ *
+ * Two rules run through all of it:
+ *
+ * * **Money arrives as a decimal string of poisha, never a JSON number** (invariant 1).
+ *   `JSON.parse` turns every number into a float, and a float is exactly where a taka
+ *   goes missing — ৳1,23,456.78 is 12345678 poisha, which survives as a string and
+ *   does not survive a round trip through a format with 53 bits of mantissa once the
+ *   numbers get large. The schema refuses anything that is not digits.
+ * * **No cost field is accepted from a client** (invariant 5, D-072). There is no unit
+ *   cost, no WAC and no dispatch value anywhere in this file. The selling price is a
+ *   client's to send; what a unit cost is the server's to know, and a request that
+ *   could name it is a request that could set gross profit.
+ */
+
+/** Integer poisha as a decimal string. Positive or zero unless stated otherwise. */
+const poishaString = z
+  .string()
+  .regex(/^\d{1,16}$/, 'Amounts are integer poisha written as digits.');
+
+const uuid = z.string().uuid();
+
+/**
+ * A phone number as typed, normalised by the domain rather than here.
+ *
+ * Deliberately permissive at the edge and strict in `normalizeBdPhone`: the schema's job
+ * is to refuse a body that is not a string of plausible length, and the domain's job is
+ * to decide what a Bangladeshi mobile number is. Duplicating the rule in a Zod regex
+ * would give two answers to "is this the same buyer", and the one the schema gave would
+ * be the one nobody tested.
+ */
+const phoneInput = z.string().min(6).max(32);
+
+const reason = z.string().trim().min(3).max(500);
+
+export const orderIdSchema = uuid;
+
+/** From `packages/contracts` (`channels.ts`), so promo scope speaks the same words. */
+export const orderChannels = ORDER_CHANNELS;
+
+/** §9's `source` block: where the order came from, for M11's attribution. */
+const sourceSchema = z
+  .object({
+    pageId: z.string().max(120).optional(),
+    campaignId: z.string().max(120).optional(),
+    adId: z.string().max(120).optional(),
+    landingPageId: uuid.optional(),
+    chatwootConversationId: z.string().max(120).optional(),
+    // M42 (D-742): the inbox conversation the order was taken from, so its contact becomes a
+    // customer and the chat links to the order.
+    inboxConversationId: uuid.optional(),
+    // M54 (D-959): the website's five-digit campaign link the shopper arrived through.
+    campaignLinkCode: z
+      .string()
+      .regex(/^[1-9][0-9]{4}$/)
+      .optional(),
+    utmSource: z.string().max(120).optional(),
+    utmMedium: z.string().max(120).optional(),
+    utmCampaign: z.string().max(120).optional(),
+    utmContent: z.string().max(120).optional(),
+    // M11: the fifth UTM parameter. A landing page forwards all five, and dropping one at
+    // the edge would make a paid-search keyword unrecoverable after the fact.
+    utmTerm: z.string().max(120).optional(),
+  })
+  .strict();
+
+const addressSchema = z
+  .object({
+    districtId: z.number().int().positive().optional(),
+    thanaId: z.number().int().positive().optional(),
+    area: z.string().trim().max(160).optional(),
+    addressLine: z.string().trim().min(3).max(500),
+  })
+  .strict();
+
+export const createCustomerSchema = z
+  .object({
+    phone: phoneInput,
+    name: z.string().trim().min(1).max(200),
+    birthday: z.string().date().optional(),
+    anniversary: z.string().date().optional(),
+    gender: z.enum(['female', 'male', 'other']).optional(),
+    ageBand: z.string().trim().max(40).optional(),
+    profession: z.string().trim().max(120).optional(),
+    tags: z.array(z.string().trim().min(1).max(40)).max(20).optional(),
+    notes: z.string().trim().max(2000).optional(),
+    address: addressSchema.optional(),
+    /**
+     * M48 (D-875): a new person on this number even though someone already uses it (a relative, a
+     * colleague on the shop's phone). Left out, the number names whoever the resolver picks.
+     */
+    newPerson: z.boolean().optional(),
+    /** Whose the number is from this person's side, and why they use it (D-871). */
+    phoneRelation: z.enum(PHONE_RELATIONS).optional(),
+    phoneNote: z.string().trim().min(1).max(500).optional(),
+  })
+  .strict();
+
+export type CreateCustomerInput = z.infer<typeof createCustomerSchema>;
+
+/**
+ * `PATCH /v1/customers/:id`: the buyer's details (M49, D-891: the contracts' schema, shared with
+ * the inbox's customer card) and, as before, a new default address. `null` removes a value;
+ * leaving a field out keeps it (M16): a birthday typed on the wrong buyer must be removable, or
+ * the occasions job greets them every year for it.
+ */
+export const updateCustomerSchema = customerDetailsSchema
+  .extend({ address: addressSchema.optional() })
+  .strict();
+
+export type UpdateCustomerInput = z.infer<typeof updateCustomerSchema>;
+
+export const customerQuerySchema = z
+  .object({
+    /** A phone fragment, a name fragment, or a whole number. */
+    q: z.string().trim().min(2).max(64).optional(),
+    limit: z.coerce.number().int().min(1).max(100).default(25),
+    offset: z.coerce.number().int().min(0).max(100_000).default(0),
+  })
+  .strict();
+
+export type CustomerQuery = z.infer<typeof customerQuerySchema>;
+
+export const createOrderLineSchema = z
+  .object({
+    skuId: uuid,
+    qty: z.number().int().min(1).max(100_000),
+    /**
+     * Optional. Left out, the SKU's list price is used.
+     *
+     * Allowed because an agent negotiating on a phone call is the ordinary case in this
+     * business, not an exception — and refusing it would mean the discount had to be
+     * expressed as an order-level figure, which loses which item was discounted and
+     * makes §7's partial-delivery apportioning guess.
+     */
+    unitPricePoisha: poishaString.optional(),
+    discountPoisha: poishaString.optional(),
+  })
+  .strict();
+
+export const createOrderSchema = z
+  .object({
+    channel: z.enum(orderChannels),
+    source: sourceSchema.optional(),
+    /** One of the two: an existing buyer, or enough to create one. */
+    customerId: uuid.optional(),
+    customer: createCustomerSchema.optional(),
+    /**
+     * Left out, the buyer's default address is snapshotted. M48 (D-878): `phone` is the
+     * recipient's, when the parcel goes to someone other than the buyer; left out, the buyer's.
+     */
+    shipTo: addressSchema
+      .extend({ name: z.string().trim().min(1).max(200).optional(), phone: phoneInput.optional() })
+      .optional(),
+    /**
+     * M48 (D-878): whom the order is for. `someone_else` needs the recipient's name and phone on
+     * `shipTo`; left out, it is `someone_else` when `shipTo.phone` is not the buyer's.
+     */
+    placedFor: z.enum(PLACED_FOR).optional(),
+    placedForNote: z.string().trim().min(1).max(500).optional(),
+    /** The recipient's own customer record, when the staff linked one (D-880). */
+    recipientCustomerId: uuid.optional(),
+    /** Make a customer record for the recipient, or link the one their number names (D-880). */
+    saveRecipient: z.boolean().optional(),
+    /** Put the recipient's number on the buyer too, as `someone_else` (D-881). */
+    addRecipientNumberToBuyer: z.boolean().optional(),
+    branchId: uuid.optional(),
+    locationId: uuid.optional(),
+    deliveryZoneId: uuid.optional(),
+    courierId: uuid.optional(),
+    /** Left out, the zone's charge applies. Set to override it for this order. */
+    deliveryChargePoisha: poishaString.optional(),
+    discountPoisha: poishaString.optional(),
+    /*
+     * No advance. Money paid ahead is a claim recorded against the order and verified by
+     * accounts (`POST /v1/orders/:id/advances`, D-230): an amount on the create body lowered
+     * the COD with no journal behind it at all, which is exactly what M17 check 2 forbids.
+     */
+    /**
+     * A promo code as the buyer typed it. Never an id and never an amount: the server
+     * prices the word against the lines it priced itself (D-204). The promo module checks
+     * the real shape and answers PROMO_NOT_FOUND for anything else.
+     */
+    promoCode: z.string().trim().min(3).max(40).optional(),
+    notes: z.string().trim().max(2000).optional(),
+    /** Assign on creation. Left out, the order joins the unassigned queue (§6). */
+    assignedTo: z.string().min(1).max(64).optional(),
+    lines: z.array(createOrderLineSchema).min(1).max(100),
+  })
+  .strict()
+  .refine((value) => value.customerId !== undefined || value.customer !== undefined, {
+    message: 'An order needs a buyer: name an existing customer or supply one.',
+  });
+
+export type CreateOrderInput = z.infer<typeof createOrderSchema>;
+
+/**
+ * What an agent may still change after the order exists (§24's order desk).
+ *
+ * Narrower than `createOrderSchema` on purpose, and the omissions are the design:
+ *
+ * * **No buyer.** Moving an order to a different customer moves its history with it, so it
+ *   is not an edit: a supervisor's `POST /v1/orders/:id/buyer` (M48, D-882), audited, with
+ *   both buyers' counts moved through the stats path.
+ * * **No branch.** The branch is what `branch` scope is evaluated against, so a caller
+ *   who could change it could move an order out of their own reach and into somebody
+ *   else's — or, worse, take one from another branch by claiming it into theirs.
+ * * **No advance.** An advance is a posted journal (§7). It moves by recording another
+ *   one, never by editing a column, or the ledger and the order stop agreeing.
+ *
+ * `lines`, when present, is the whole new set rather than a patch: a partial line edit
+ * has to say what happened to the lines it does not mention, and every answer to that
+ * is a guess.
+ */
+export const updateOrderSchema = z
+  .object({
+    shipTo: addressSchema
+      .extend({ name: z.string().trim().min(1).max(200).optional(), phone: phoneInput.optional() })
+      .optional(),
+    locationId: uuid.optional(),
+    deliveryZoneId: uuid.optional(),
+    courierId: uuid.optional(),
+    deliveryChargePoisha: poishaString.optional(),
+    /** The order-level discount. Line discounts travel on the lines. */
+    discountPoisha: poishaString.optional(),
+    notes: z.string().trim().max(2000).optional(),
+    lines: z.array(createOrderLineSchema).min(1).max(100).optional(),
+    /**
+     * M50 (D-921): the offers the person chose in the editor's panel. Present, the order's
+     * discounts are given back and these are priced and taken again; `discountPoisha` and
+     * `deliveryChargePoisha` are then the typed discount and the charge before any offer.
+     */
+    discountIds: z.array(uuid).max(10).optional(),
+  })
+  .strict();
+
+export type UpdateOrderInput = z.infer<typeof updateOrderSchema>;
+
+/**
+ * M50 (D-922): a packed order changed. It is cancelled and replaced by a new order with these
+ * terms, in one transaction; the reason goes on the cancelled order.
+ */
+export const replaceOrderSchema = z
+  .object({
+    reason,
+    shipTo: addressSchema
+      .extend({ name: z.string().trim().min(1).max(200).optional(), phone: phoneInput.optional() })
+      .optional(),
+    deliveryChargePoisha: poishaString.optional(),
+    discountPoisha: poishaString.optional(),
+    notes: z.string().trim().max(2000).optional(),
+    lines: z.array(createOrderLineSchema).min(1).max(100),
+    discountIds: z.array(uuid).max(10).optional(),
+  })
+  .strict();
+
+export type ReplaceOrderInput = z.infer<typeof replaceOrderSchema>;
+
+/**
+ * M50 (D-921): the editor's offers panel. `edit` prices the order's lines as edited; `return`
+ * prices what the buyer keeps of a parcel already with the courier, at the order's own prices.
+ */
+export const orderOffersSchema = z.discriminatedUnion('mode', [
+  z
+    .object({
+      mode: z.literal('edit'),
+      lines: z.array(createOrderLineSchema).min(1).max(100),
+      discountPoisha: poishaString.optional(),
+      deliveryChargePoisha: poishaString,
+      discountIds: z.array(uuid).max(10).default([]),
+    })
+    .strict(),
+  z
+    .object({
+      mode: z.literal('return'),
+      keep: z
+        .array(z.object({ skuId: uuid, qty: z.number().int().min(0).max(100_000) }).strict())
+        .min(1)
+        .max(100),
+      deliveryChargePoisha: poishaString,
+      discountIds: z.array(uuid).max(10).default([]),
+    })
+    .strict(),
+]);
+
+export type OrderOffersInput = z.infer<typeof orderOffersSchema>;
+
+/** M50: the order editor's product picker. Nothing typed lists every product, newest first. */
+export const orderPickerQuerySchema = z
+  .object({
+    q: z.string().trim().max(100).optional(),
+    offset: z.coerce.number().int().min(0).max(100_000).optional(),
+  })
+  .strict();
+
+export type OrderPickerQuery = z.infer<typeof orderPickerQuerySchema>;
+
+/** The order list's queues (M11, M41). */
+export const ORDER_QUEUES = [
+  'unassigned',
+  'mine',
+  'new',
+  'verifying',
+  'callbacks',
+  'confirmed_today',
+  'hub_print',
+  'hub_packing',
+  'hub_packed',
+  'hub_handed',
+] as const;
+export type OrderQueue = (typeof ORDER_QUEUES)[number];
+
+export const orderQuerySchema = z
+  .object({
+    status: z
+      .enum([
+        'pending',
+        'confirmed',
+        'on_hold',
+        'packed',
+        'shipped',
+        'delivered',
+        'partially_delivered',
+        'return_in_transit',
+        'returned',
+        'cancelled',
+        'exchange',
+      ])
+      .optional(),
+    /**
+     * `unassigned` is §6's queue; `mine` is what the caller is working. M41 (D-719) adds the
+     * desk's tabs (`new`, `verifying`, `callbacks`, `confirmed_today`) and the hub's
+     * (`hub_print`, `hub_packing`, `hub_packed`, `hub_handed`); every one narrows the scope.
+     */
+    queue: z.enum(ORDER_QUEUES).optional(),
+    /** M41: the hub's stock location. Narrows; never widens. */
+    locationId: uuid.optional(),
+    customerId: uuid.optional(),
+    /** M48 (D-876): only the orders whose buyer the desk should check. */
+    buyerCheck: z.enum(BUYER_CHECKS).optional(),
+    q: z.string().trim().min(2).max(64).optional(),
+    from: z.string().date().optional(),
+    to: z.string().date().optional(),
+    // M11's list filters (Build list: status, channel, date, agent, zone).
+    channel: z.enum(orderChannels).optional(),
+    /** An agent's user id. Narrows the caller's scope; it never reaches past it. */
+    assignedTo: z.string().trim().min(1).max(64).optional(),
+    zoneId: uuid.optional(),
+    limit: z.coerce.number().int().min(1).max(100).default(25),
+    offset: z.coerce.number().int().min(0).max(100_000).default(0),
+  })
+  .strict();
+
+export type OrderQuery = z.infer<typeof orderQuerySchema>;
+
+/** Comma-separated uuids, or the same parameter repeated. */
+function uuidList(max: number) {
+  return z
+    .union([z.string(), z.array(z.string())])
+    .transform((value) =>
+      (Array.isArray(value) ? value : value.split(','))
+        .map((entry) => entry.trim())
+        .filter((entry) => entry !== ''),
+    )
+    .pipe(z.array(uuid).min(1).max(max));
+}
+
+/**
+ * The duplicate warning's question (M11 Build list): this number, these SKUs, 24 hours.
+ *
+ * The SKUs are the ones on the form right now, not "any SKU": the same buyer ordering a
+ * second, different item an hour later is a customer coming back, and warning on it would
+ * teach the desk to ignore the banner by lunchtime.
+ */
+export const duplicatesQuerySchema = z
+  .object({ phone: phoneInput, skuIds: uuidList(100) })
+  .strict();
+
+export type DuplicatesQuery = z.infer<typeof duplicatesQuerySchema>;
+
+/**
+ * `GET /v1/customers/lookup?phone=` — the desk's first keystrokes. M48 (D-875): `customerId`
+ * picks one of the people the number names, for the desk's chooser.
+ */
+export const customerLookupSchema = z
+  .object({ phone: phoneInput, customerId: uuid.optional() })
+  .strict();
+
+/**
+ * Bulk confirm (M11 Build list). A hundred at a time, and each one on its own.
+ *
+ * The cap is the size of a desk's evening queue, not a performance limit: a request that
+ * could confirm ten thousand orders is one misclick from reserving a warehouse.
+ */
+export const bulkConfirmSchema = z
+  .object({ ids: z.array(uuid).min(1).max(100) })
+  .strict()
+  .refine((value) => new Set(value.ids).size === value.ids.length, {
+    message: 'An order appears twice in that list.',
+  });
+
+export type BulkConfirmInput = z.infer<typeof bulkConfirmSchema>;
+
+/** Pack or ship up to a hundred orders, each in its own transaction (D-393). */
+export const bulkTransitionSchema = z
+  .object({ ids: z.array(uuid).min(1).max(100), trigger: z.enum(['pack', 'ship']) })
+  .strict()
+  .refine((value) => new Set(value.ids).size === value.ids.length, {
+    message: 'An order appears twice in that list.',
+  });
+
+export type BulkTransitionInput = z.infer<typeof bulkTransitionSchema>;
+
+/** The document kinds §22 renders for an order. `label` is the parcel's address label. */
+export const orderDocumentKinds = ['invoice', 'packing_slip', 'label'] as const;
+export type OrderDocumentKindName = (typeof orderDocumentKinds)[number];
+
+/**
+ * The paper a document prints on (M43): A4, or A5 for the packing slip. The invoice is A4 and
+ * the label 4 × 6 in whatever is asked, so asking A5 of them is refused rather than ignored.
+ */
+export const documentPapers = ['a4', 'a5'] as const;
+
+const a5OnlyForTheSlip = (query: { kind: string; paper: string }) =>
+  query.paper === 'a4' || query.kind === 'packing_slip';
+const A5_MESSAGE = { message: 'A5 is for the packing slip.', path: ['paper'] };
+
+/** Bulk print: one PDF, one page (or label) per order, in the order the ids were given. */
+export const bulkDocumentQuerySchema = z
+  .object({
+    ids: uuidList(100),
+    kind: z.enum(orderDocumentKinds).default('invoice'),
+    paper: z.enum(documentPapers).default('a4'),
+  })
+  .strict()
+  .refine(a5OnlyForTheSlip, A5_MESSAGE);
+
+/**
+ * The buyer list's filters (M11 Build list: product, SKU, size, date, channel).
+ *
+ * * `product` is a fragment of the product name **as the order line recorded it**. The
+ *   line's snapshot is what the buyer actually bought, and reading the catalog's current
+ *   name from this module would cross invariant 12 for a rename the buyer never saw.
+ * * `sku` is an exact SKU code.
+ * * `size` is a variant code (`M`, `XL`, `42`) and matches a variant segment of the
+ *   line's SKU code — the segments `buildSkuCode` appends after the product's sequence
+ *   number. See `buyers.repository.ts` for why this is the size and not a guess.
+ * * `from` and `to` are Asia/Dhaka order dates (invariant 8).
+ */
+export const buyerQuerySchema = z
+  .object({
+    product: z.string().trim().min(2).max(120).optional(),
+    sku: z
+      .string()
+      .trim()
+      .toUpperCase()
+      .regex(/^[A-Z0-9]+(-[A-Z0-9]+)*$/, 'That is not a SKU code.')
+      .max(64)
+      .optional(),
+    size: z
+      .string()
+      .trim()
+      .toUpperCase()
+      .regex(/^[A-Z0-9]{1,8}$/, 'A size is a variant code such as M or 42.')
+      .optional(),
+    from: z.string().date().optional(),
+    to: z.string().date().optional(),
+    channel: z.enum(orderChannels).optional(),
+    limit: z.coerce.number().int().min(1).max(200).default(50),
+    offset: z.coerce.number().int().min(0).max(1_000_000).default(0),
+  })
+  .strict();
+
+export type BuyerQuery = z.infer<typeof buyerQuerySchema>;
+
+export const buyerExportQuerySchema = buyerQuerySchema
+  .omit({ limit: true, offset: true })
+  .extend({ format: z.enum(['csv', 'xlsx']).default('csv') })
+  .strict();
+
+export type BuyerExportQuery = z.infer<typeof buyerExportQuerySchema>;
+
+/** Confirm carries no body; an empty object is accepted so existing clients keep working. */
+/** M52 (D-941): `lots` is the person's answer when the order is above the brand's limit. */
+export const confirmOrderSchema = z
+  .object({ lots: z.number().int().min(1).max(20).optional() })
+  .strict();
+
+export const holdOrderSchema = z.object({ reason }).strict();
+export const cancelOrderSchema = z.object({ reason }).strict();
+
+export const assignOrderSchema = z.object({ assignedTo: z.string().min(1).max(64) }).strict();
+
+export const shipOrderSchema = z
+  .object({
+    courierId: uuid.optional(),
+    /** The courier's own tracking reference, when the desk booked by hand. */
+    consignmentNo: z.string().trim().max(120).optional(),
+  })
+  .strict();
+
+const deliveredLineSchema = z
+  .object({ skuId: uuid, deliveredQty: z.number().int().min(0).max(100_000) })
+  .strict();
+
+export const deliverOrderSchema = z
+  .object({
+    /**
+     * What the rider actually collected. Left out, the order's COD is assumed.
+     *
+     * Present because §7 sends any difference to Sales discounts with a reason, and the
+     * difference only exists if the real figure can be reported.
+     */
+    collectedPoisha: poishaString.optional(),
+    differenceReason: reason.optional(),
+    /** Set for a partial delivery: the units that actually arrived. */
+    lines: z.array(deliveredLineSchema).min(1).max(100).optional(),
+    occurredAt: z.string().datetime().optional(),
+  })
+  .strict();
+
+export type DeliverOrderInput = z.infer<typeof deliverOrderSchema>;
+
+/** Why the goods came back, from the fixed list (M17, D-234). Required on every return. */
+const returnReason = z.enum(RETURN_REASON_CODES);
+
+export const startReturnSchema = z.object({ reason: reason.optional() }).strict();
+
+export const exchangeOrderSchema = z
+  .object({
+    reason,
+    returnReason,
+    /** Which of the delivered units are coming back. */
+    returnLines: z
+      .array(z.object({ skuId: uuid, qty: z.number().int().min(1).max(100_000) }).strict())
+      .min(1)
+      .max(100),
+    /** The replacement order's lines. May be a different SKU, a different size, more. */
+    lines: z.array(createOrderLineSchema).min(1).max(100),
+    /** The replacement's delivery charge. Left out, the original order's. */
+    deliveryChargePoisha: poishaString.optional(),
+    locationId: uuid.optional(),
+    occurredAt: z.string().datetime().optional(),
+  })
+  .strict();
+
+export type ExchangeOrderInput = z.infer<typeof exchangeOrderSchema>;
+
+/** A positive amount: an advance of nothing is not a claim. */
+const positivePoisha = poishaString.refine((value) => BigInt(value) > 0n, {
+  message: 'An advance is a positive amount.',
+});
+
+/**
+ * An advance claim, as the agent types it from the buyer's SMS (M17, D-230).
+ *
+ * The reference is normalised by the domain (`normalizeTransactionRef`), so the schema only
+ * bounds its length. No wallet and no date: which wallet received the money is accounts'
+ * to say when they verify it, and nothing posts until they do.
+ */
+export const recordAdvanceSchema = z
+  .object({
+    method: z.enum(ADVANCE_METHODS),
+    transactionRef: z.string().trim().min(1).max(40),
+    amountPoisha: positivePoisha,
+    note: z.string().trim().min(1).max(500).optional(),
+  })
+  .strict();
+
+export type RecordAdvanceInput = z.infer<typeof recordAdvanceSchema>;
+
+/** Accounts verifies a claim into the wallet the money arrived in. */
+export const verifyAdvanceSchema = z.object({ walletAccountId: uuid }).strict();
+
+export const rejectAdvanceSchema = z.object({ reason: z.string().trim().min(3).max(500) }).strict();
+
+/** The money went back. Left out, the wallet it came into; the outgoing TrxID if there is one. */
+export const refundAdvanceSchema = z
+  .object({
+    walletAccountId: uuid.optional(),
+    refundRef: z.string().trim().min(1).max(40).optional(),
+  })
+  .strict();
+
+export type RefundAdvanceInput = z.infer<typeof refundAdvanceSchema>;
+
+/** The accounts queue: pending claims and refunds owed, unless asked for others. */
+export const advanceQueueSchema = z
+  .object({
+    status: z
+      .string()
+      .optional()
+      .transform((value) =>
+        (value ?? 'pending,refund_due')
+          .split(',')
+          .map((entry) => entry.trim())
+          .filter((entry) => entry !== ''),
+      )
+      .pipe(z.array(z.enum(ADVANCE_STATUSES)).min(1).max(ADVANCE_STATUSES.length)),
+  })
+  .strict();
+
+const isoDate = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'A date is YYYY-MM-DD.');
+
+/** The report by reason, over Asia/Dhaka business dates, both ends included. */
+export const returnReasonReportSchema = z
+  .object({ from: isoDate, to: isoDate })
+  .strict()
+  .refine((value) => value.from <= value.to, { message: '`from` is after `to`.' });
+
+export const availabilityQuerySchema = z
+  .object({
+    /** Comma-separated SKU ids, or repeated `skuId` params. */
+    skuIds: z
+      .union([z.string(), z.array(z.string())])
+      .transform((value) =>
+        (Array.isArray(value) ? value : value.split(','))
+          .map((entry) => entry.trim())
+          .filter((entry) => entry !== ''),
+      )
+      .pipe(z.array(uuid).min(1).max(100)),
+    locationId: uuid.optional(),
+  })
+  .strict();
+
+export type AvailabilityQuery = z.infer<typeof availabilityQuerySchema>;
+
+export const zoneLookupSchema = z
+  .object({
+    districtId: z.coerce.number().int().positive(),
+    thanaId: z.coerce.number().int().positive().optional(),
+  })
+  .strict();
+
+export const upsertZoneSchema = z
+  .object({
+    code: z
+      .string()
+      .trim()
+      .regex(/^[a-z][a-z0-9_]{1,31}$/, 'A zone code is lower snake_case.'),
+    nameEn: z.string().trim().min(1).max(120),
+    /**
+     * The zone's Bangla name, kept as data for the website (D-756). Optional: the console is
+     * English only (D-750). A new zone without one takes the English name; an existing zone
+     * keeps the one it has.
+     */
+    nameBn: z.string().trim().min(1).max(120).optional(),
+    chargePoisha: poishaString,
+    defaultCourierId: uuid.optional(),
+    position: z.number().int().min(0).max(1000).optional(),
+    isActive: z.boolean().optional(),
+  })
+  .strict();
+
+export type UpsertZoneInput = z.infer<typeof upsertZoneSchema>;
+
+export const documentQuerySchema = z
+  .object({
+    kind: z.enum(orderDocumentKinds).default('invoice'),
+    paper: z.enum(documentPapers).default('a4'),
+  })
+  .strict()
+  .refine(a5OnlyForTheSlip, A5_MESSAGE);
+
+/**
+ * The re-engagement list's filters (M16; architecture §10 "no purchase in N days, plus
+ * filters"). `days` is how long since the buyer's last order, by the Dhaka calendar;
+ * `minDelivered` keeps the list to people who have actually received something.
+ */
+export const reengagementQuerySchema = z
+  .object({
+    days: z.coerce.number().int().min(1).max(3_650).default(90),
+    minDelivered: z.coerce.number().int().min(1).max(1_000).default(1),
+    segment: z.enum(RFM_SEGMENTS).optional(),
+    limit: z.coerce.number().int().min(1).max(200).default(50),
+    offset: z.coerce.number().int().min(0).max(1_000_000).default(0),
+  })
+  .strict();
+
+export type ReengagementQuery = z.infer<typeof reengagementQuerySchema>;
+
+export const reengagementExportQuerySchema = reengagementQuerySchema
+  .omit({ limit: true, offset: true })
+  // `meta_audience` (M18): the same buyers as SHA-256 phone hashes, for a Meta customer
+  // list — no name, no number (D-259).
+  .extend({ format: z.enum(['csv', 'xlsx', 'meta_audience']).default('csv') })
+  .strict();
+
+export type ReengagementExportQuery = z.infer<typeof reengagementExportQuerySchema>;

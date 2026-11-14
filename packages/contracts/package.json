@@ -1,0 +1,60 @@
+{
+  "name": "@elysium/contracts",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./telephony": {
+      "types": "./dist/telephony.d.ts",
+      "default": "./dist/telephony.js"
+    },
+    "./tracking": {
+      "types": "./dist/tracking.d.ts",
+      "default": "./dist/tracking.js"
+    },
+    "./print-checks": {
+      "types": "./dist/print-checks.d.ts",
+      "default": "./dist/print-checks.js"
+    },
+    "./staff-removal": {
+      "types": "./dist/staff-removal.d.ts",
+      "default": "./dist/staff-removal.js"
+    },
+    "./staff-activity": {
+      "types": "./dist/staff-activity.d.ts",
+      "default": "./dist/staff-activity.js"
+    },
+    "./customers": {
+      "types": "./dist/customers.d.ts",
+      "default": "./dist/customers.js"
+    },
+    "./packing-returns": {
+      "types": "./dist/packing-returns.d.ts",
+      "default": "./dist/packing-returns.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -b",
+    "typecheck": "tsc -b",
+    "lint": "eslint .",
+    "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\""
+  },
+  "devDependencies": {
+    "fast-check": "catalog:",
+    "@elysium/config": "workspace:*",
+    "eslint": "catalog:",
+    "typescript": "catalog:"
+  },
+  "dependencies": {
+    "@casl/ability": "catalog:",
+    "zod": "catalog:"
+  }
+}

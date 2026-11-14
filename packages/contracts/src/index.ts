@@ -1,0 +1,97 @@
+/**
+ * @elysium/contracts
+ *
+ * Zod schemas and DTO types, the CASL permission matrix, error codes and event
+ * types (architecture §4).
+ *
+ * M02a seeds it with the identity schemas, because the rule is that a form
+ * validates against the same schema the server does — one definition, shared,
+ * so a client-side rule can never drift looser than the server's. M02b adds the
+ * permission matrix; M04 adds the error codes and event schemas.
+ */
+export const PACKAGE_NAME = '@elysium/contracts' as const;
+
+export {
+  credentialsSchema,
+  membershipRoleSchema,
+  MEMBERSHIP_ROLES,
+  recoveryCodeSchema,
+  switchOrgSchema,
+  totpCodeSchema,
+  createUserSchema,
+  credentialResetSchema,
+  deactivateUserSchema,
+  ownerLinkSignInSchema,
+  roleGrantSchema,
+  setPasswordSchema,
+  setRolesSchema,
+  userIdParamSchema,
+  type Credentials,
+  type CreateUser,
+  type CredentialResetInput,
+  type DeactivateUser,
+  type OwnerLinkSignIn,
+  type RoleGrant,
+  type SetPassword,
+  type SetRoles,
+  type MembershipRole,
+  type RecoveryCode,
+  type SwitchOrg,
+  type TotpCode,
+} from './iam.js';
+
+export * from './approvals.js';
+export * from './approvals-list.js';
+export * from './events.js';
+export * from './errors.js';
+export * from './ledger.js';
+export * from './permissions/index.js';
+export * from './pos.js';
+export * from './channels.js';
+// M33: the brand's website, run from its ERP.
+export * from './storefront.js';
+// M34: buying on the website: cart, checkout, accounts, payments, emails.
+export * from './storefront-buying.js';
+// M39a: what uses a row, before it is deleted or archived.
+export * from './usage.js';
+// M35b: campaign links, tracking, the ncom.bd marketplace, the scanner and order labels.
+export * from './storefront-marketing.js';
+// M38b: the packing station and the packing video.
+export * from './packing.js';
+// D-956: the developer's credit at the foot of every printed document.
+export * from './documents.js';
+// M46: Labels and Packaging: terminals, printers, the print queue, lots and the handover.
+export * from './labels.js';
+// M40: My account and the brand's two-step policy.
+export * from './account.js';
+// M38a: stickers of a custom size, and the extra line (D-650, D-651).
+export * from './stickers.js';
+// Duplicating products, several copies each (D-662, D-663).
+export * from './duplicates.js';
+// M42: the unified inbox.
+export * from './inbox.js';
+// M44a: the inbox's saved replies.
+export * from './inbox-saved-replies.js';
+// M45: voice messages and calls in the inbox.
+export * from './inbox-voice.js';
+// M47: phone calls through Envo's request shapes are the `@elysium/contracts/telephony`
+// subpath, so the console's first download does not carry them (its budget, D-852). Their
+// types alone are here too (erased from every bundle), for the generated API client, which
+// names each contract type from this entry.
+export type * from './telephony.js';
+// M54: the tracking hub's request shapes are the `@elysium/contracts/tracking` subpath (the
+// console's first-download budget, as M47's); their types are here for the generated client.
+export type * from './tracking.js';
+// M41: the order workflow: ownership, presence, desk profiles, calls and auto-assign.
+export * from './workflow.js';
+// D-913: connecting a courier in one step (choose it, add its keys, default or not).
+export * from './courier.js';
+// M48: a buyer's numbers and the people one number names. The schemas are the
+// `@elysium/contracts/customers` subpath's, so the console's first download does not carry them;
+// the types are here too, for the generated client (D-870 to D-889).
+export type * from './customers.js';
+// Removing a deactivated staff sign-in (D-1023): the schema is the `@elysium/contracts/staff-removal`
+// subpath's, out of the console's first download; the types are here too, for the generated client.
+export type * from './staff-removal.js';
+// D-1025: the print check's input; the schema is the `@elysium/contracts/print-checks` subpath's.
+export type * from './print-checks.js';

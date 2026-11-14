@@ -1,0 +1,567 @@
+import { deliveredFromLots } from '@elysium/domain/packing';
+import {
+  Button,
+  Checkbox,
+  Dialog,
+  buttonVariants,
+  controlClassName,
+  poishaToTaka,
+  takaToPoisha,
+} from '@elysium/ui';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { Link } from '@tanstack/react-router';
+import { useId, useState, type ReactNode } from 'react';
+
+import { ApiError } from '../../api.js';
+import { setParcelStatus, type ParcelRow } from '../courier/api.js';
+import { orderPrints } from '../labels/api.js';
+import {
+  cancelOrder,
+  confirmOrder,
+  deliverOrder,
+  deliverPartially,
+  holdOrder,
+  packOrder,
+  releaseHold,
+  shipOrder,
+  startReturn,
+  type OrderDetail,
+  type OrderTrigger,
+} from './api.js';
+import { ConfirmLotsDialog } from './confirm-lots-dialog.js';
+import { useOrdersT, type OrdersMessageKey } from './messages.js';
+import { offeredActions } from './order-actions-logic.js';
+import { useOwnerGuard } from './owner-guard.js';
+import { liveParcelOf, useOrderParcels } from './parcel-panel.js';
+import { ProductImage } from '../../ui/product-image.js';
+
+/**
+ * The order's lifecycle buttons (D-392).
+ *
+ * **What is offered is the server's answer, not a list kept here.** The order detail carries
+ * `transitions` — the rows of §9's table from the order's status, read off the same table
+ * `transition()` enforces — and a button exists only for a trigger in it, and only for a
+ * caller holding `update Order`. The console keeps no copy of the state machine to drift from
+ * the real one: before this, Cancel was offered on a held order, which §9 does not allow, and
+ * the server's refusal was the first anybody heard of it.
+ *
+ * Exchange is not here: it is a new order with its own lines, raised from its own form.
+ *
+ * **An order with a parcel at a courier is delivered and received on the parcel.** Mark
+ * delivered and Partial delivery then go through the parcel's own status route, which writes
+ * the parcel's collection beside the order's journals — the order routes do not, and the
+ * server refuses them for an order with a live parcel. Start return moves the parcel's tracking
+ * with the order (ledger audit of D-392, W2). Receive return opens the order at the return
+ * station, Packaging → Returns, the one place a return is received (D-1027).
+ */
+
+const LABEL: Readonly<Record<OrderTrigger, OrdersMessageKey | null>> = {
+  confirm: 'orders.detail.confirm',
+  hold: 'orders.action.hold',
+  release_hold: 'orders.action.release',
+  cancel: 'orders.detail.cancel',
+  pack: 'orders.action.pack',
+  ship: 'orders.action.ship',
+  deliver: 'orders.action.deliver',
+  deliver_partially: 'orders.action.partial',
+  start_return: 'orders.action.startReturn',
+  receive_return: 'orders.action.receiveReturn',
+  exchange: null,
+};
+
+/**
+ * The desk's moves, which the owner's name guards (M41, D-710): on somebody else's order each
+ * asks "go ahead?" first. The hub's moves (pack, ship, deliver, returns) never do.
+ */
+const OWNER_GATED: ReadonlySet<OrderTrigger> = new Set([
+  'confirm',
+  'hold',
+  'release_hold',
+  'cancel',
+]);
+
+/** The two that move the order straight on; everything else asks something first. */
+const IMMEDIATE: ReadonlySet<OrderTrigger> = new Set(['confirm', 'pack', 'release_hold']);
+
+const control = `${controlClassName} w-full disabled:opacity-50`;
+const area =
+  'w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none';
+
+export function OrderActions({
+  order,
+  mayUpdate,
+  mayOpenReturns,
+}: {
+  readonly order: OrderDetail;
+  readonly mayUpdate: boolean;
+  /** D-1027: a return is received at Packaging → Returns, which needs `read PackingTerminal`. */
+  readonly mayOpenReturns?: boolean;
+}) {
+  const t = useOrdersT();
+  const queryClient = useQueryClient();
+  const [open, setOpen] = useState<{ trigger: OrderTrigger; ack: boolean } | null>(null);
+  const [failure, setFailure] = useState<string | null>(null);
+  // M52 (D-941): the server asked how many lots; the confirm goes again with the answer.
+  const [askLots, setAskLots] = useState<{ ack: boolean } | null>(null);
+  const { guard } = useOwnerGuard();
+
+  const immediate = useMutation({
+    mutationFn: async ({ trigger, ack }: { trigger: OrderTrigger; ack: boolean }) => {
+      if (trigger === 'confirm') await confirmOrder(order.id, ack);
+      else if (trigger === 'pack') await packOrder(order.id);
+      else if (trigger === 'release_hold') await releaseHold(order.id, ack);
+    },
+    onSuccess: async () => {
+      setFailure(null);
+      await queryClient.invalidateQueries({ queryKey: ['orders'] });
+      await queryClient.invalidateQueries({ queryKey: ['courier'] });
+    },
+    onError: async (error, { ack }) => {
+      if (error instanceof ApiError && error.code === 'ORDER_LOTS_REQUIRED') {
+        setFailure(null);
+        setAskLots({ ack });
+        return;
+      }
+      setFailure(error instanceof Error ? error.message : String(error));
+      // Somebody may have taken the order meanwhile: show who.
+      await queryClient.invalidateQueries({ queryKey: ['orders'] });
+    },
+  });
+
+  const parcels = useOrderParcels(order.id);
+  const parcel = liveParcelOf(parcels.data?.items ?? []);
+
+  const offered = offeredActions(order.transitions, mayUpdate);
+  if (offered.length === 0) return null;
+
+  return (
+    <>
+      {offered.map((trigger) => {
+        const label = LABEL[trigger];
+        if (label === null) return null;
+        const primary = trigger === 'confirm' || trigger === 'pack' || trigger === 'ship';
+        const quiet = trigger === 'cancel' || trigger === 'hold';
+        if (trigger === 'receive_return') {
+          // D-1027: received at the return station only, on camera, piece by piece or by hand.
+          if (mayOpenReturns !== true) return null;
+          return (
+            <Link
+              key={trigger}
+              to="/packaging"
+              search={{ tab: 'returns', ret: order.id }}
+              className={buttonVariants({ variant: 'outline', size: 'sm' })}
+            >
+              {t(label)}
+            </Link>
+          );
+        }
+        return (
+          <Button
+            key={trigger}
+            size="sm"
+            variant={primary ? 'primary' : quiet ? 'ghost' : 'outline'}
+            disabled={immediate.isPending}
+            onClick={() => {
+              const run = (ack: boolean) => {
+                if (IMMEDIATE.has(trigger)) immediate.mutate({ trigger, ack });
+                else setOpen({ trigger, ack });
+              };
+              if (OWNER_GATED.has(trigger)) guard(run);
+              else run(false);
+            }}
+          >
+            {t(label)}
+          </Button>
+        );
+      })}
+      {failure === null ? null : (
+        <p role="alert" className="basis-full text-sm text-destructive">
+          {t('orders.detail.actionFailed')} {failure}
+        </p>
+      )}
+      {askLots === null ? null : (
+        <ConfirmLotsDialog
+          orderId={order.id}
+          orderNo={order.orderNo}
+          pieces={order.lines.reduce((sum, line) => sum + line.qty, 0)}
+          ack={askLots.ack}
+          onClose={() => setAskLots(null)}
+          onConfirmed={() => {
+            setAskLots(null);
+            void queryClient.invalidateQueries({ queryKey: ['orders'] });
+            void queryClient.invalidateQueries({ queryKey: ['courier'] });
+          }}
+        />
+      )}
+      {open === null ? null : (
+        <ActionDialog
+          order={order}
+          trigger={open.trigger}
+          ack={open.ack}
+          parcel={parcel}
+          onClose={() => setOpen(null)}
+        />
+      )}
+    </>
+  );
+}
+
+/** The dialog for a move that needs a reason, a figure or an inspection first. */
+function ActionDialog({
+  order,
+  trigger,
+  ack,
+  parcel,
+  onClose,
+}: {
+  readonly order: OrderDetail;
+  readonly trigger: OrderTrigger;
+  /** M41 (D-710): the person said go ahead on somebody else's order. */
+  readonly ack: boolean;
+  /** The order's live parcel, through which a delivery is recorded when there is one. */
+  readonly parcel: ParcelRow | null;
+  readonly onClose: () => void;
+}) {
+  const t = useOrdersT();
+  const queryClient = useQueryClient();
+  const id = useId();
+  const cod = order.amounts.codAmountPoisha;
+
+  const [reason, setReason] = useState('');
+  const [consignmentNo, setConsignmentNo] = useState('');
+  // A full delivery defaults to the COD; a partial one is typed, because the full COD is
+  // wrong by definition when units came back (the M15 rule for a courier's partial).
+  const [collected, setCollected] = useState(
+    trigger === 'deliver_partially' ? '' : poishaToTaka(cod),
+  );
+  const [delivered, setDelivered] = useState<Record<string, string>>(() =>
+    Object.fromEntries(order.lines.map((line) => [line.skuId, String(line.qty)])),
+  );
+  const [problem, setProblem] = useState<string | null>(null);
+  // M53 (D-948): an order packed in several lots fills its quantities from the lots delivered.
+  const lotRecord = useQuery({
+    queryKey: ['labels', 'order', order.id],
+    queryFn: () => orderPrints(order.id),
+    enabled: trigger === 'deliver_partially',
+    retry: false,
+  });
+  const lotChoices =
+    (lotRecord.data?.lotCount ?? 1) > 1 &&
+    (lotRecord.data?.lots ?? []).every((lot) => (lot.items ?? []).length > 0)
+      ? (lotRecord.data?.lots ?? [])
+      : [];
+  const [deliveredLots, setDeliveredLots] = useState<ReadonlySet<number>>(new Set());
+
+  const collectedPoisha = takaToPoisha(collected);
+  const differs = collectedPoisha !== null && collectedPoisha !== cod;
+
+  /** What the request will be, or the sentence that says why it cannot be sent yet. */
+  function prepare(): (() => Promise<unknown>) | string {
+    switch (trigger) {
+      case 'hold':
+        return reason.trim().length < 3
+          ? t('orders.action.reasonNeeded')
+          : () => holdOrder(order.id, reason.trim(), ack);
+      case 'cancel':
+        return reason.trim().length < 3
+          ? t('orders.action.reasonNeeded')
+          : () => cancelOrder(order.id, reason.trim(), ack);
+      case 'ship':
+        return () =>
+          shipOrder(
+            order.id,
+            consignmentNo.trim() === '' ? {} : { consignmentNo: consignmentNo.trim() },
+          );
+      case 'deliver': {
+        if (collectedPoisha === null || collectedPoisha.startsWith('-')) {
+          return t('orders.action.amountNeeded');
+        }
+        if (differs && reason.trim().length < 3) return t('orders.action.differenceNeeded');
+        if (parcel !== null) {
+          return () =>
+            setParcelStatus(parcel.id, {
+              status: 'delivered',
+              rawStatus: MANUAL_RAW_STATUS,
+              reason: differs ? reason.trim() : MANUAL_RAW_STATUS,
+              collectedPoisha,
+              ...(differs ? { differenceReason: reason.trim() } : {}),
+            });
+        }
+        return () =>
+          deliverOrder(order.id, {
+            collectedPoisha,
+            ...(differs ? { differenceReason: reason.trim() } : {}),
+          });
+      }
+      case 'deliver_partially': {
+        if (collectedPoisha === null || collectedPoisha.startsWith('-')) {
+          return t('orders.action.amountNeeded');
+        }
+        const lines = order.lines.map((line) => ({
+          skuId: line.skuId,
+          deliveredQty: Number.parseInt(delivered[line.skuId] ?? '', 10),
+        }));
+        const fits = lines.every(
+          (line, index) =>
+            Number.isInteger(line.deliveredQty) &&
+            line.deliveredQty >= 0 &&
+            line.deliveredQty <= (order.lines[index]?.qty ?? 0),
+        );
+        if (!fits) return t('orders.action.qtyNeeded');
+        if (parcel !== null) {
+          return () =>
+            setParcelStatus(parcel.id, {
+              status: 'partial_delivered',
+              rawStatus: MANUAL_RAW_STATUS,
+              reason: reason.trim().length >= 3 ? reason.trim() : MANUAL_RAW_STATUS,
+              collectedPoisha,
+              ...(reason.trim().length >= 3 ? { differenceReason: reason.trim() } : {}),
+              deliveredLines: lines,
+            });
+        }
+        return () =>
+          deliverPartially(order.id, {
+            collectedPoisha,
+            lines,
+            ...(reason.trim().length >= 3 ? { differenceReason: reason.trim() } : {}),
+          });
+      }
+      case 'start_return':
+        if (parcel !== null) {
+          // The parcel's tracking moves with the order, so the returns list finds it.
+          return () =>
+            setParcelStatus(parcel.id, {
+              status: 'return_in_transit',
+              rawStatus: MANUAL_RAW_STATUS,
+              reason: reason.trim().length >= 3 ? reason.trim() : MANUAL_RAW_STATUS,
+            });
+        }
+        return () => startReturn(order.id, reason.trim().length >= 3 ? reason.trim() : undefined);
+      case 'receive_return':
+      case 'confirm':
+      case 'pack':
+      case 'release_hold':
+      case 'exchange':
+        // Immediate moves never open this dialog, exchange has its own form, and a return is
+        // received at the return station (D-1027).
+        return t('orders.errorDetail');
+    }
+  }
+
+  const save = useMutation({
+    mutationFn: (send: () => Promise<unknown>) => send(),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ['orders'] });
+      await queryClient.invalidateQueries({ queryKey: ['courier'] });
+      onClose();
+    },
+    onError: (error) =>
+      setProblem(error instanceof ApiError ? error.message : t('orders.errorDetail')),
+  });
+
+  const copy = DIALOG_COPY[trigger];
+  const field = (key: string, label: string, input: ReactNode) => (
+    <label key={key} className="block space-y-1.5 text-sm" htmlFor={`${id}-${key}`}>
+      <span className="font-medium">{label}</span>
+      {input}
+    </label>
+  );
+
+  return (
+    <Dialog
+      open
+      onOpenChange={(next) => {
+        if (!next) onClose();
+      }}
+      title={copy === undefined ? '' : t(copy.title)}
+      {...(copy?.detail === undefined ? {} : { description: t(copy.detail) })}
+      closeLabel={t('orders.close')}
+      footer={
+        <>
+          <Button variant="outline" onClick={onClose}>
+            {t('orders.detail.keep')}
+          </Button>
+          <Button
+            variant={trigger === 'cancel' ? 'destructive' : 'primary'}
+            disabled={save.isPending}
+            onClick={() => {
+              const prepared = prepare();
+              if (typeof prepared === 'string') {
+                setProblem(prepared);
+                return;
+              }
+              setProblem(null);
+              save.mutate(prepared);
+            }}
+          >
+            {copy === undefined ? '' : t(copy.submit)}
+          </Button>
+        </>
+      }
+    >
+      <div className="space-y-3">
+        {trigger === 'ship'
+          ? field(
+              'consignment',
+              t('orders.action.shipConsignment'),
+              <input
+                id={`${id}-consignment`}
+                value={consignmentNo}
+                maxLength={120}
+                autoComplete="off"
+                className={`${control} tabular-nums`}
+                onChange={(event) => setConsignmentNo(event.target.value)}
+              />,
+            )
+          : null}
+
+        {trigger === 'deliver' || trigger === 'deliver_partially'
+          ? field(
+              'collected',
+              t('orders.action.collected'),
+              <input
+                id={`${id}-collected`}
+                inputMode="decimal"
+                value={collected}
+                className={`${control} tabular-nums`}
+                onChange={(event) => setCollected(event.target.value)}
+              />,
+            )
+          : null}
+
+        {trigger === 'deliver_partially' ? (
+          <fieldset className="space-y-2">
+            <legend className="text-sm font-medium">{t('orders.action.partialLines')}</legend>
+            {lotChoices.length === 0 ? null : (
+              <div className="flex flex-wrap items-center gap-3" data-testid="partial-lots">
+                <span className="text-sm text-muted-foreground">
+                  {t('orders.action.partialLots')}
+                </span>
+                {lotChoices.map((lot) => (
+                  <label key={lot.lot} className="flex items-center gap-2 text-sm">
+                    <Checkbox
+                      checked={deliveredLots.has(lot.lot)}
+                      onCheckedChange={() => {
+                        const next = new Set(deliveredLots);
+                        if (next.has(lot.lot)) next.delete(lot.lot);
+                        else next.add(lot.lot);
+                        setDeliveredLots(next);
+                        setDelivered(
+                          Object.fromEntries(
+                            [...deliveredFromLots(lotChoices, next, order.lines)].map(
+                              ([skuId, qty]) => [skuId, String(qty)],
+                            ),
+                          ),
+                        );
+                      }}
+                    />
+                    {`${t('orders.action.partialLot')} ${String(lot.lot)}`}
+                  </label>
+                ))}
+              </div>
+            )}
+            {order.lines.map((line) => (
+              <div key={line.skuId} className="flex items-center gap-3">
+                <ProductImage skuId={line.skuId} alt={line.productName} size="xs" />
+                <label
+                  className="flex flex-1 items-center justify-between gap-3 text-sm"
+                  htmlFor={`${id}-qty-${line.skuId}`}
+                >
+                  <span className="tabular-nums">
+                    {line.skuCode} <span className="text-muted-foreground">/ {line.qty}</span>
+                  </span>
+                  <input
+                    id={`${id}-qty-${line.skuId}`}
+                    inputMode="numeric"
+                    value={delivered[line.skuId] ?? ''}
+                    className={`${control.replace('w-full', 'w-20')} text-right tabular-nums`}
+                    onChange={(event) =>
+                      setDelivered((current) => ({ ...current, [line.skuId]: event.target.value }))
+                    }
+                  />
+                </label>
+              </div>
+            ))}
+          </fieldset>
+        ) : null}
+
+        {trigger === 'ship' || (trigger === 'deliver' && !differs)
+          ? null
+          : field(
+              'reason',
+              t(reasonLabel(trigger)),
+              <textarea
+                id={`${id}-reason`}
+                rows={3}
+                value={reason}
+                maxLength={500}
+                className={area}
+                onChange={(event) => setReason(event.target.value)}
+              />,
+            )}
+      </div>
+      {problem === null ? null : (
+        <p role="alert" className="mt-3 text-sm text-destructive">
+          {problem}
+        </p>
+      )}
+    </Dialog>
+  );
+}
+
+/**
+ * The raw status recorded on a parcel event a person sets from the order detail. §9 keeps the
+ * courier's raw word on every event; a manual entry's raw word says who said it. Stored data,
+ * read in the parcel timeline and in disputes, so it is not translated.
+ */
+const MANUAL_RAW_STATUS = 'Set from the order detail';
+
+function reasonLabel(trigger: OrderTrigger): OrdersMessageKey {
+  switch (trigger) {
+    case 'cancel':
+      return 'orders.detail.cancelReason';
+    case 'hold':
+      return 'orders.action.holdReason';
+    case 'deliver':
+    case 'deliver_partially':
+      return 'orders.action.differenceReason';
+    case 'receive_return':
+    case 'start_return':
+    case 'ship':
+    case 'confirm':
+    case 'pack':
+    case 'release_hold':
+    case 'exchange':
+      return 'orders.action.note';
+  }
+}
+
+const DIALOG_COPY: Partial<
+  Record<
+    OrderTrigger,
+    { title: OrdersMessageKey; detail?: OrdersMessageKey; submit: OrdersMessageKey }
+  >
+> = {
+  hold: { title: 'orders.action.holdTitle', submit: 'orders.action.hold' },
+  cancel: { title: 'orders.detail.cancelTitle', submit: 'orders.detail.cancel' },
+  ship: {
+    title: 'orders.action.shipTitle',
+    detail: 'orders.action.shipDetail',
+    submit: 'orders.action.ship',
+  },
+  deliver: {
+    title: 'orders.action.deliverTitle',
+    detail: 'orders.action.deliverDetail',
+    submit: 'orders.action.deliver',
+  },
+  deliver_partially: {
+    title: 'orders.action.partialTitle',
+    detail: 'orders.action.partialDetail',
+    submit: 'orders.action.partial',
+  },
+  start_return: {
+    title: 'orders.action.startReturnTitle',
+    detail: 'orders.action.startReturnDetail',
+    submit: 'orders.action.startReturn',
+  },
+};

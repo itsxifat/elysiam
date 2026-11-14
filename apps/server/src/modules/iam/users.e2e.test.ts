@@ -1,0 +1,1259 @@
+import { randomUUID } from 'node:crypto';
+
+import { base32 } from '@better-auth/utils/base32';
+import type { MembershipRole } from '@elysium/contracts';
+import { withGlobal, withOrg, withSystem } from '@elysium/db';
+import { createTestUser, grantMembership } from '@elysium/db/testing';
+import { sql } from 'drizzle-orm';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+
+import {
+  auditRowsFor,
+  createBranch,
+  expectRefused,
+  ORG_A,
+  ORG_B,
+  PASSWORD,
+  startHttpHarness,
+  type Client,
+  type HttpHarness,
+  type InjectedResponse,
+  type RoleClient,
+} from '../../testing/http-harness.js';
+import { seedCustomer, seedOrder } from '../orders/orders.testing.js';
+
+/**
+ * The staff screen's API against real Postgres (gaps-users-auth, D-400 to D-409).
+ *
+ * Every rule about whose access an admin may change is exercised from both sides: the
+ * case the rule allows, so the refusal is not just "everything is refused", and the case
+ * it refuses. Sign-in outcomes are asserted by signing in for real, through Better Auth,
+ * the CSRF check and the enrolment wall, because "the account is deactivated" means
+ * nothing until the person actually cannot get back in.
+ */
+
+let harness: HttpHarness;
+let admin: RoleClient;
+let admin2: RoleClient;
+let superAdmin: { client: Client; userId: string };
+
+const NEW_PASSWORD = 'a-brand-new-passphrase';
+
+beforeAll(async () => {
+  harness = await startHttpHarness('users');
+  admin = await harness.asRole('org_admin', ORG_A);
+  admin2 = await harness.asRole('org_admin', ORG_A);
+
+  // A platform super admin, with no membership anywhere: made by the owner role only.
+  const root = await createTestUser({ name: 'Root', isSuperAdmin: true });
+  await setPasswordFor(root.email);
+  const signedIn = await signIn(root.email);
+  await enrol(signedIn.client);
+  const entered = await signedIn.client.request('POST', '/v1/me/active-org', {
+    body: { orgId: ORG_A },
+  });
+  expect(entered.statusCode, entered.body).toBe(201);
+  superAdmin = { client: signedIn.client, userId: root.id };
+}, 300_000);
+
+afterAll(async () => {
+  await harness?.close();
+}, 60_000);
+
+// --- helpers ---------------------------------------------------------------------------
+
+function json<T>(response: InjectedResponse): T {
+  return JSON.parse(response.body) as T;
+}
+
+/** Set a password through Better Auth's own reset, from the server (D-402). */
+async function setPasswordFor(email: string, password: string = PASSWORD): Promise<void> {
+  await harness.auth.auth.api.requestPasswordReset({
+    body: { email, redirectTo: '/accept-invite' },
+    headers: new Headers(),
+  });
+  const token = harness.tokens.take(email);
+  if (token === undefined) throw new Error(`no token for ${email}`);
+  await harness.auth.auth.api.resetPassword({ body: { newPassword: password, token } });
+}
+
+async function signIn(
+  email: string,
+  password: string = PASSWORD,
+): Promise<{ client: Client; response: InjectedResponse }> {
+  const client = harness.client();
+  await client.request('GET', '/v1/auth/login-branding');
+  const response = await client.request('POST', '/api/auth/sign-in/email', {
+    body: { email, password },
+  });
+  return { client, response };
+}
+
+/** Enrol TOTP the way the console does, and verify it. */
+async function enrol(client: Client): Promise<void> {
+  const enabled = await client.request('POST', '/api/auth/two-factor/enable', {
+    body: { password: PASSWORD, method: 'totp' },
+  });
+  expect(enabled.statusCode, enabled.body).toBe(200);
+  const { totpURI } = json<{ totpURI: string }>(enabled);
+  const secret = new TextDecoder().decode(
+    base32.decode(new URL(totpURI).searchParams.get('secret') ?? ''),
+  );
+  const { code } = await harness.auth.auth.api.generateTOTP({ body: { secret } });
+  const verified = await client.request('POST', '/api/auth/two-factor/verify-totp', {
+    body: { code },
+  });
+  expect(verified.statusCode, verified.body).toBe(200);
+}
+
+interface Member {
+  readonly userId: string;
+  readonly email: string;
+}
+
+/** A person with roles in a brand, optionally with a password already set. */
+async function member(
+  roles: readonly MembershipRole[],
+  options: {
+    readonly orgId?: string;
+    readonly password?: boolean;
+    readonly alsoIn?: { orgId: string; role: MembershipRole };
+    readonly twoFactorEnabled?: boolean;
+  } = {},
+): Promise<Member> {
+  const user = await createTestUser({
+    name: `Staff ${roles.join('+')}`,
+    ...(options.twoFactorEnabled === undefined
+      ? {}
+      : { twoFactorEnabled: options.twoFactorEnabled }),
+  });
+  for (const role of roles) {
+    await grantMembership({ userId: user.id, orgId: options.orgId ?? ORG_A, role });
+  }
+  if (options.alsoIn !== undefined) {
+    await grantMembership({
+      userId: user.id,
+      orgId: options.alsoIn.orgId,
+      role: options.alsoIn.role,
+    });
+  }
+  if (options.password !== false) await setPasswordFor(user.email);
+  return { userId: user.id, email: user.email };
+}
+
+/** Signed in and switched into a brand, for someone with no second factor owed. */
+async function session(person: Member, orgId: string = ORG_A): Promise<Client> {
+  const { client, response } = await signIn(person.email);
+  expect(response.statusCode, response.body).toBe(200);
+  const entered = await client.request('POST', '/v1/me/active-org', { body: { orgId } });
+  expect(entered.statusCode, entered.body).toBe(201);
+  return client;
+}
+
+async function grantedBy(userId: string, orgId: string = ORG_A): Promise<(string | null)[]> {
+  const rows = await withSystem(
+    async (tx) =>
+      tx.execute<{ granted_by: string | null }>(sql`
+        select granted_by from iam.memberships
+        where org_id = ${orgId} and user_id = ${userId} and is_active
+      `),
+    { orgId },
+  );
+  return [...rows].map((row) => row.granted_by);
+}
+
+/** Everyone in a person's grant history here (D-410). */
+async function grantersOf(userId: string, orgId: string = ORG_A): Promise<string[]> {
+  const rows = await withSystem(
+    async (tx) =>
+      tx.execute<{ granted_by: string }>(sql`
+        select granted_by from iam.membership_granters
+        where org_id = ${orgId} and user_id = ${userId}
+      `),
+    { orgId },
+  );
+  return [...rows].map((row) => row.granted_by);
+}
+
+async function decide(
+  checker: Client,
+  approvalId: string,
+  decision: 'approved' | 'rejected',
+): Promise<InjectedResponse> {
+  return checker.request('POST', `/v1/approvals/${approvalId}/decide`, { body: { decision } });
+}
+
+async function redeem(token: string, password: string = NEW_PASSWORD): Promise<InjectedResponse> {
+  const client = harness.client();
+  await client.request('GET', '/v1/auth/login-branding');
+  return client.request('POST', '/api/auth/reset-password', {
+    body: { newPassword: password, token },
+  });
+}
+
+interface StaffRow {
+  userId: string;
+  status: string;
+  roles: { role: string; branchIds: string[] }[];
+  twoFactorEnabled: boolean;
+  lastSignInAt: string | null;
+  hasPassword: boolean;
+  linkExpiresAt: string | null;
+  inOtherBrand: boolean;
+  isSelf: boolean;
+  resetNeedsApproval: boolean;
+}
+
+async function staff(client: Client = admin.client): Promise<{
+  items: StaffRow[];
+  resets: { id: string; userId: string; kind: string; status: string; mine: boolean }[];
+}> {
+  const listed = await client.request('GET', '/v1/users');
+  expect(listed.statusCode, listed.body).toBe(200);
+  return json(listed);
+}
+
+// --- the list ----------------------------------------------------------------------------
+
+describe('GET /v1/users', () => {
+  it("lists this brand's people with their roles and sign-in state, and nobody else's", async () => {
+    const here = await member(['sales']);
+    const invited = await member(['warehouse'], { password: false });
+    const elsewhere = await member(['sales'], { orgId: ORG_B });
+    const signedIn = await session(here);
+    expect((await signedIn.request('GET', '/v1/me')).statusCode).toBe(200);
+
+    const { items } = await staff();
+    const row = items.find((item) => item.userId === here.userId);
+    expect(row).toMatchObject({
+      status: 'active',
+      roles: [{ role: 'sales', branchIds: [] }],
+      hasPassword: true,
+      isSelf: false,
+      canMakeSuperAdmin: false,
+    });
+    expect(row?.lastSignInAt).not.toBeNull();
+    expect(items.find((item) => item.userId === invited.userId)?.status).toBe('invited');
+    expect(items.some((item) => item.userId === elsewhere.userId)).toBe(false);
+    expect(items.find((item) => item.userId === admin.userId)).toMatchObject({
+      isSelf: true,
+      twoFactorEnabled: true,
+    });
+  });
+
+  it('is refused to every role but org_admin', async () => {
+    const sales = await harness.asRole('sales', ORG_A);
+    const accounts = await harness.asRole('accounts', ORG_A);
+    expect((await sales.client.request('GET', '/v1/users')).statusCode).toBe(403);
+    expect((await accounts.client.request('GET', '/v1/users')).statusCode).toBe(403);
+  });
+});
+
+// --- roles ---------------------------------------------------------------------------------
+
+describe('PUT /v1/users/:id/roles', () => {
+  it('replaces roles and branch scope, takes effect at once, and records the admin as granter', async () => {
+    const person = await member(['sales']);
+    const client = await session(person);
+    const branch = await createBranch(ORG_A, `U${Date.now().toString(36).slice(-5)}`);
+
+    const changed = await admin.client.request('PUT', `/v1/users/${person.userId}/roles`, {
+      body: {
+        roles: [
+          { role: 'warehouse', branchIds: [] },
+          { role: 'branch_manager', branchIds: [branch] },
+        ],
+      },
+    });
+    expect(changed.statusCode, changed.body).toBe(200);
+    expect(json<StaffRow>(changed).roles).toEqual([
+      { role: 'branch_manager', branchIds: [branch] },
+      { role: 'warehouse', branchIds: [] },
+    ]);
+
+    // The same session, its next request: no sign-in needed for the change to apply.
+    const me = json<{ roles: string[]; branchIds: string[] }>(
+      await client.request('GET', '/v1/me'),
+    );
+    expect([...me.roles].sort()).toEqual(['branch_manager', 'warehouse']);
+    expect(me.branchIds).toEqual([branch]);
+    expect(await grantedBy(person.userId)).toEqual([admin.userId, admin.userId]);
+
+    const audit = await auditRowsFor(ORG_A, person.userId);
+    expect(audit.some((row) => row.action === 'iam.roles_changed')).toBe(true);
+  });
+
+  it('refuses a change to your own roles, so an admin cannot widen or keep their own access', async () => {
+    const own = await admin.client.request('PUT', `/v1/users/${admin.userId}/roles`, {
+      body: {
+        roles: [
+          { role: 'org_admin', branchIds: [] },
+          { role: 'accounts', branchIds: [] },
+        ],
+      },
+    });
+    expect(own.statusCode).toBe(403);
+    expect(json<{ code: string }>(own).code).toBe('USER_SELF_MANAGEMENT');
+  });
+
+  it('refuses a sales user changing anyone, themselves included', async () => {
+    const sales = await harness.asRole('sales', ORG_A);
+    const self = await sales.client.request('PUT', `/v1/users/${sales.userId}/roles`, {
+      body: { roles: [{ role: 'org_admin', branchIds: [] }] },
+    });
+    expect(self.statusCode).toBe(403);
+    expect(await grantedBy(sales.userId)).toHaveLength(1);
+  });
+
+  it("answers 404 for another brand's person, and refuses another brand's branch", async () => {
+    const elsewhere = await member(['sales'], { orgId: ORG_B });
+    const foreign = await admin.client.request('PUT', `/v1/users/${elsewhere.userId}/roles`, {
+      body: { roles: [{ role: 'warehouse', branchIds: [] }] },
+    });
+    expect(foreign.statusCode).toBe(404);
+
+    const person = await member(['sales']);
+    const otherBranch = await createBranch(ORG_B, `X${Date.now().toString(36).slice(-5)}`);
+    const wrongBranch = await admin.client.request('PUT', `/v1/users/${person.userId}/roles`, {
+      body: { roles: [{ role: 'branch_manager', branchIds: [otherBranch] }] },
+    });
+    expect(wrongBranch.statusCode).toBe(400);
+    const noBranch = await admin.client.request('PUT', `/v1/users/${person.userId}/roles`, {
+      body: { roles: [{ role: 'branch_manager', branchIds: [] }] },
+    });
+    expect(noBranch.statusCode).toBe(400);
+  });
+
+  it('protects a super admin from an org admin, and not from another super admin', async () => {
+    const root = await createTestUser({ name: 'Another root', isSuperAdmin: true });
+    await grantMembership({ userId: root.id, orgId: ORG_A, role: 'sales' });
+
+    const byAdmin = await admin.client.request('PUT', `/v1/users/${root.id}/roles`, {
+      body: { roles: [{ role: 'warehouse', branchIds: [] }] },
+    });
+    expect(byAdmin.statusCode).toBe(403);
+    expect(json<{ code: string }>(byAdmin).code).toBe('USER_PROTECTED');
+    for (const path of ['deactivate', 'password-link', 'two-factor/reset']) {
+      const refused = await admin.client.request('POST', `/v1/users/${root.id}/${path}`, {
+        body: { reason: 'testing protection' },
+      });
+      expect(refused.statusCode, path).toBe(403);
+    }
+
+    const bySuper = await superAdmin.client.request('PUT', `/v1/users/${root.id}/roles`, {
+      body: { roles: [{ role: 'warehouse', branchIds: [] }] },
+    });
+    expect(bySuper.statusCode, bySuper.body).toBe(200);
+  });
+});
+
+// --- deactivation --------------------------------------------------------------------------
+
+describe('POST /v1/users/:id/deactivate', () => {
+  it('ends the leaver’s sessions and refuses their next sign-in, keeping what they wrote', async () => {
+    const leaver = await member(['accounts']);
+    const signedIn = await signIn(leaver.email);
+    await enrol(signedIn.client);
+    await signedIn.client.request('POST', '/v1/me/active-org', { body: { orgId: ORG_A } });
+    const raised = await signedIn.client.request('POST', '/v1/approvals', {
+      body: { type: 'supplier_payment', amountPoisha: '500000' },
+    });
+    expect(raised.statusCode, raised.body).toBe(201);
+    const { id: approvalId } = json<{ id: string }>(raised);
+
+    const done = await admin.client.request('POST', `/v1/users/${leaver.userId}/deactivate`, {
+      body: { reason: 'Resigned' },
+    });
+    expect(done.statusCode, done.body).toBe(201);
+    expect(json<{ sessionsEnded: number }>(done).sessionsEnded).toBeGreaterThan(0);
+
+    expect((await signedIn.client.request('GET', '/v1/me')).statusCode).toBe(401);
+    const again = await signIn(leaver.email);
+    expect(again.response.statusCode).toBe(403);
+    expect(json<{ code: string }>(again.response).code).toBe('ACCOUNT_INACTIVE');
+
+    // What they raised is still there, raised by them.
+    const [kept] = await withSystem(
+      async (tx) =>
+        tx.execute<{ requested_by: string }>(sql`
+          select requested_by from approvals.approval_requests where id = ${approvalId}
+        `),
+      { orgId: ORG_A },
+    );
+    expect(kept?.requested_by).toBe(leaver.userId);
+
+    const { items } = await staff();
+    expect(items.find((item) => item.userId === leaver.userId)).toMatchObject({
+      status: 'deactivated',
+      roles: [],
+    });
+    const audit = await auditRowsFor(ORG_A, leaver.userId);
+    expect(audit.some((row) => row.action === 'iam.user_deactivated')).toBe(true);
+
+    // Giving them a role again lets them back in.
+    const back = await admin.client.request('PUT', `/v1/users/${leaver.userId}/roles`, {
+      body: { roles: [{ role: 'warehouse', branchIds: [] }] },
+    });
+    expect(back.statusCode, back.body).toBe(200);
+    expect((await signIn(leaver.email)).response.statusCode).toBe(200);
+  });
+
+  it('leaves a person who works for another brand signed in there', async () => {
+    const shared = await member(['sales'], { alsoIn: { orgId: ORG_B, role: 'warehouse' } });
+    const inB = await session(shared, ORG_B);
+
+    const done = await admin.client.request('POST', `/v1/users/${shared.userId}/deactivate`, {
+      body: {},
+    });
+    expect(done.statusCode, done.body).toBe(201);
+    expect((await inB.request('GET', '/v1/me')).statusCode).toBe(200);
+    expect((await signIn(shared.email)).response.statusCode).toBe(200);
+  });
+
+  it('refuses deactivating yourself, and someone already deactivated', async () => {
+    const self = await admin.client.request('POST', `/v1/users/${admin.userId}/deactivate`, {
+      body: {},
+    });
+    expect(self.statusCode).toBe(403);
+
+    const person = await member(['sales']);
+    await admin.client.request('POST', `/v1/users/${person.userId}/deactivate`, { body: {} });
+    const twice = await admin.client.request('POST', `/v1/users/${person.userId}/deactivate`, {
+      body: {},
+    });
+    expect(twice.statusCode).toBe(409);
+  });
+});
+
+// --- password links ------------------------------------------------------------------------
+
+describe('POST /v1/users/:id/password-link', () => {
+  it('sends an invite again for three days, voiding the last one, and it works once', async () => {
+    const invited = await member(['sales'], { password: false });
+
+    const first = await admin.client.request('POST', `/v1/users/${invited.userId}/password-link`, {
+      body: { reason: 'Lost the first invite' },
+    });
+    expect(first.statusCode, first.body).toBe(201);
+    const firstLink = json<{ outcome: string; kind: string; token: string; expiresAt: string }>(
+      first,
+    );
+    expect(firstLink).toMatchObject({ outcome: 'issued', kind: 'invite' });
+    const hours = (Date.parse(firstLink.expiresAt) - Date.now()) / 3_600_000;
+    expect(hours).toBeGreaterThan(71);
+    expect(hours).toBeLessThanOrEqual(72);
+
+    const second = json<{ token: string }>(
+      await admin.client.request('POST', `/v1/users/${invited.userId}/password-link`, {
+        body: { reason: 'Again' },
+      }),
+    );
+    expect((await redeem(firstLink.token)).statusCode).toBe(400);
+    expect((await redeem(second.token)).statusCode).toBe(200);
+    expect((await redeem(second.token, 'yet-another-passphrase')).statusCode).toBe(400);
+    expect((await signIn(invited.email, NEW_PASSWORD)).response.statusCode).toBe(200);
+
+    // Whoever held the link could have set the password: they join the lineage (D-410).
+    expect(await grantersOf(invited.userId)).toContain(admin.userId);
+  });
+
+  it('resets a password: the old one stops at once, sessions end, the link lasts an hour', async () => {
+    const person = await member(['sales']);
+    const client = await session(person);
+
+    const issued = await admin.client.request('POST', `/v1/users/${person.userId}/password-link`, {
+      body: { reason: 'Forgot it' },
+    });
+    expect(issued.statusCode, issued.body).toBe(201);
+    const link = json<{ kind: string; token: string; expiresAt: string }>(issued);
+    expect(link.kind).toBe('password');
+    expect((Date.parse(link.expiresAt) - Date.now()) / 60_000).toBeLessThanOrEqual(60);
+
+    expect((await client.request('GET', '/v1/me')).statusCode).toBe(401);
+    expect((await signIn(person.email)).response.statusCode).toBe(401);
+
+    expect((await redeem(link.token)).statusCode).toBe(200);
+    expect((await signIn(person.email, NEW_PASSWORD)).response.statusCode).toBe(200);
+
+    // The token is never written to the audit log, by the service or by the net.
+    const audit = await auditRowsFor(ORG_A, person.userId);
+    expect(audit.some((row) => row.action === 'iam.password_link_issued')).toBe(true);
+    const everything = await withSystem(
+      async (tx) =>
+        tx.execute<{ n: number }>(sql`
+          select count(*)::int as n from audit.audit_log
+          where before::text like ${`%${link.token}%`} or after::text like ${`%${link.token}%`}
+        `),
+      { orgId: ORG_A },
+    );
+    expect(everything[0]?.n).toBe(0);
+  });
+
+  it('refuses an expired link', async () => {
+    const person = await member(['sales']);
+    const { token } = json<{ token: string }>(
+      await admin.client.request('POST', `/v1/users/${person.userId}/password-link`, {
+        body: { reason: 'Expiry' },
+      }),
+    );
+    await withGlobal(async (tx) =>
+      tx.execute(sql`
+        update iam.verifications set expires_at = now() - interval '1 minute'
+        where identifier = ${`reset-password:${token}`}
+      `),
+    );
+    expect((await redeem(token)).statusCode).toBe(400);
+  });
+
+  it('resets an admin’s password at once: no second admin (D-954)', async () => {
+    const target = await harness.asRole('org_admin', ORG_A);
+    const asked = await admin.client.request('POST', `/v1/users/${target.userId}/password-link`, {
+      body: { reason: 'Locked out' },
+    });
+    expect(asked.statusCode, asked.body).toBe(201);
+    const link = json<{ outcome: string; kind: string; token: string }>(asked);
+    expect(link).toMatchObject({ outcome: 'issued', kind: 'password' });
+    expect((await target.client.request('GET', '/v1/me')).statusCode).toBe(401);
+    expect((await redeem(link.token)).statusCode).toBe(200);
+  });
+
+  it('leaves a cross-brand person to a super admin, who acts alone', async () => {
+    const shared = await member(['accounts'], { alsoIn: { orgId: ORG_B, role: 'sales' } });
+    const refused = await admin.client.request('POST', `/v1/users/${shared.userId}/password-link`, {
+      body: { reason: 'Cross brand' },
+    });
+    expect(refused.statusCode).toBe(403);
+    expect(json<{ code: string }>(refused).code).toBe('USER_PROTECTED');
+
+    const bySuper = await superAdmin.client.request(
+      'POST',
+      `/v1/users/${shared.userId}/password-link`,
+      { body: { reason: 'Cross brand' } },
+    );
+    expect(bySuper.statusCode, bySuper.body).toBe(201);
+    expect(json<{ outcome: string }>(bySuper).outcome).toBe('issued');
+  });
+
+  it('refuses resetting your own sign-in', async () => {
+    const own = await admin.client.request('POST', `/v1/users/${admin.userId}/password-link`, {
+      body: { reason: 'Myself' },
+    });
+    expect(own.statusCode).toBe(403);
+    const ownTwoFactor = await admin.client.request(
+      'POST',
+      `/v1/users/${admin.userId}/two-factor/reset`,
+      { body: { reason: 'Myself' } },
+    );
+    expect(ownTwoFactor.statusCode).toBe(403);
+  });
+
+  it('limits one person to five resets a day', async () => {
+    const person = await member(['warehouse'], { password: false });
+    for (let index = 0; index < 5; index += 1) {
+      const issued = await admin.client.request(
+        'POST',
+        `/v1/users/${person.userId}/password-link`,
+        {
+          body: { reason: `Attempt ${String(index)}` },
+        },
+      );
+      expect(issued.statusCode, issued.body).toBe(201);
+    }
+    const sixth = await admin2.client.request('POST', `/v1/users/${person.userId}/password-link`, {
+      body: { reason: 'One too many' },
+    });
+    expect(sixth.statusCode).toBe(429);
+  });
+
+  it('keeps the public "send me a reset link" route closed', async () => {
+    const client = harness.client();
+    await client.request('GET', '/v1/auth/login-branding');
+    const response = await client.request('POST', '/api/auth/request-password-reset', {
+      body: { email: admin.email, redirectTo: '/accept-invite' },
+    });
+    expect(response.statusCode).toBe(404);
+    expect(harness.tokens.take(admin.email)).toBeUndefined();
+  });
+});
+
+// --- second factors ------------------------------------------------------------------------
+
+describe('POST /v1/users/:id/two-factor/reset', () => {
+  it('removes a sales agent’s second factor at once and ends their sessions', async () => {
+    const person = await member(['sales']);
+    const client = await session(person);
+    await enrol(client);
+
+    const reset = await admin.client.request(
+      'POST',
+      `/v1/users/${person.userId}/two-factor/reset`,
+      {
+        body: { reason: 'Lost phone' },
+      },
+    );
+    expect(reset.statusCode, reset.body).toBe(201);
+    expect(json<{ outcome: string }>(reset).outcome).toBe('completed');
+    expect((await client.request('GET', '/v1/me')).statusCode).toBe(401);
+
+    // Signs straight in: no factor left to ask for, and sales owes none.
+    const again = await signIn(person.email);
+    expect(again.response.statusCode).toBe(200);
+    expect(json<{ twoFactorRedirect?: boolean }>(again.response).twoFactorRedirect).toBeUndefined();
+
+    const nothing = await admin.client.request(
+      'POST',
+      `/v1/users/${person.userId}/two-factor/reset`,
+      { body: { reason: 'Again' } },
+    );
+    expect(nothing.statusCode).toBe(409);
+    expect(json<{ code: string }>(nothing).code).toBe('CREDENTIAL_NOTHING_TO_RESET');
+  });
+
+  it('removes an accountant’s second factor at once, then walls them until they enrol again', async () => {
+    const target = await harness.asRole('accounts', ORG_A);
+    const done = json<{ outcome: string }>(
+      await admin.client.request('POST', `/v1/users/${target.userId}/two-factor/reset`, {
+        body: { reason: 'Phone stolen' },
+      }),
+    );
+    expect(done.outcome).toBe('completed');
+    expect((await target.client.request('GET', '/v1/me')).statusCode).toBe(401);
+
+    const again = await signIn(target.email);
+    expect(again.response.statusCode).toBe(200);
+    expect(json<{ twoFactorRedirect?: boolean }>(again.response).twoFactorRedirect).toBeUndefined();
+    const walled = await again.client.request('GET', '/v1/me/orgs');
+    expect(walled.statusCode).toBe(403);
+    expect(json<{ code: string }>(walled).code).toBe('TWO_FACTOR_ENROLMENT_REQUIRED');
+
+    const audit = await auditRowsFor(ORG_A, target.userId);
+    expect(audit.some((row) => row.action === 'iam.two_factor_reset')).toBe(true);
+  });
+});
+
+// --- the database --------------------------------------------------------------------------
+
+// --- the ledger audit's findings --------------------------------------------------------
+
+describe('the permission is the rule (D-954)', () => {
+  it('refuses granting yourself a role through the invite route, and keeps the first granter (C2)', async () => {
+    const own = await admin.client.request('POST', '/v1/users', {
+      body: { email: admin.email, name: 'Me', role: 'accounts', branchIds: [] },
+    });
+    expect(own.statusCode).toBe(403);
+    expect(json<{ code: string }>(own).code).toBe('USER_SELF_MANAGEMENT');
+
+    // A person admin created, then re-granted and reshaped by admin2: every granter is kept on
+    // record, and (D-954) the person may still decide admin's requests with the permission.
+    const email = `lineage_${Date.now()}@example.invalid`;
+    const created = await admin.client.request('POST', '/v1/users', {
+      body: { email, name: 'Lineage', role: 'org_admin', branchIds: [] },
+    });
+    expect(created.statusCode, created.body).toBe(201);
+    const { userId, inviteToken } = json<{ userId: string; inviteToken: string }>(created);
+    expect((await redeem(inviteToken, PASSWORD)).statusCode).toBe(200);
+
+    await admin2.client.request('POST', '/v1/users', {
+      body: { email, name: 'Lineage', role: 'org_admin', branchIds: [] },
+    });
+    expect(await grantedBy(userId)).toEqual([admin.userId]);
+    const reshaped = await admin2.client.request('PUT', `/v1/users/${userId}/roles`, {
+      body: {
+        roles: [
+          { role: 'org_admin', branchIds: [] },
+          { role: 'sales', branchIds: [] },
+        ],
+      },
+    });
+    expect(reshaped.statusCode, reshaped.body).toBe(200);
+    expect(await grantersOf(userId)).toEqual(expect.arrayContaining([admin.userId, admin2.userId]));
+
+    const lineage = await signIn(email);
+    await enrol(lineage.client);
+    await lineage.client.request('POST', '/v1/me/active-org', { body: { orgId: ORG_A } });
+    const raised = await admin.client.request('POST', '/v1/approvals', {
+      body: { type: 'supplier_payment', amountPoisha: '700000' },
+    });
+    const { id } = json<{ id: string }>(raised);
+    const decided = await decide(lineage.client, id, 'approved');
+    expect(decided.statusCode, decided.body).toBe(201);
+  });
+
+  it('lets a checker reject an approval that names no reset (W3)', async () => {
+    const payload = JSON.stringify({
+      resetId: randomUUID(),
+      userId: 'usr_nobody',
+      kind: 'password',
+    });
+    const [orphan] = await withOrg({ orgId: ORG_A, userId: admin.userId }, async (tx) =>
+      tx.execute<{ id: string }>(sql`
+        insert into approvals.approval_requests
+          (org_id, type, status, requested_by, payload, reason)
+        values (
+          ${ORG_A}, 'credential_reset', 'pending', ${admin.userId}, ${payload}::jsonb, 'orphan'
+        )
+        returning id
+      `),
+    );
+    if (orphan === undefined) throw new Error('no orphan');
+    expect((await decide(admin2.client, orphan.id, 'approved')).statusCode).toBe(409);
+    expect((await decide(admin2.client, orphan.id, 'rejected')).statusCode).toBe(201);
+  });
+
+  it('keeps the phone-number reset pair closed (W2)', async () => {
+    const client = harness.client();
+    await client.request('GET', '/v1/auth/login-branding');
+    for (const path of ['request-password-reset', 'reset-password']) {
+      const response = await client.request('POST', `/api/auth/phone-number/${path}`, {
+        body: { phoneNumber: '+8801700000009', otp: '123456', newPassword: 'whatever-it-is' },
+      });
+      expect(response.statusCode, path).toBe(404);
+    }
+  });
+
+  it('never stores a link for idempotent replay, and says not to cache it (N4)', async () => {
+    const person = await member(['sales'], { password: false });
+    const response = await admin2.client.request(
+      'POST',
+      `/v1/users/${person.userId}/password-link`,
+      { body: { reason: 'Replay check' }, headers: { 'idempotency-key': 'replay-check-0001' } },
+    );
+    expect(response.statusCode, response.body).toBe(201);
+    expect(response.headers['cache-control']).toBe('no-store');
+    const [stored] = await withSystem(
+      async (tx) =>
+        tx.execute<{ n: number }>(sql`
+          select count(*)::int as n from http.idempotency_keys
+          where idempotency_key = 'replay-check-0001'
+        `),
+      { orgId: ORG_A },
+    );
+    expect(stored?.n).toBe(0);
+  });
+});
+
+// admin has asked for close to its 20 resets an hour by here; admin2 has asked for none.
+describe('the database holds the reset lifecycle on its own (re-audit W3)', () => {
+  it('refuses a self-grant in either lineage table', async () => {
+    const person = await member(['sales']);
+    await expectRefused(
+      withOrg({ orgId: ORG_A, userId: admin.userId }, async (tx) =>
+        tx.execute(sql`
+          insert into iam.membership_granters (org_id, user_id, granted_by, reason)
+          values (${ORG_A}, ${person.userId}, ${person.userId}, 'role_granted')
+        `),
+      ),
+      /membership_granters_not_self/,
+    );
+    await expectRefused(
+      withOrg({ orgId: ORG_A, userId: admin.userId }, async (tx) =>
+        tx.execute(sql`
+          update iam.memberships set granted_by = user_id where user_id = ${person.userId}
+        `),
+      ),
+      /memberships_not_self_granted/,
+    );
+    await expectRefused(
+      withOrg({ orgId: ORG_A, userId: admin.userId }, async (tx) =>
+        tx.execute(sql`delete from iam.membership_granters where user_id = ${person.userId}`),
+      ),
+      /permission denied/,
+    );
+  });
+
+  it('leaves one working link when two admins ask at the same moment', async () => {
+    const person = await member(['sales'], { password: false });
+    const [first, second] = await Promise.all([
+      admin2.client.request('POST', `/v1/users/${person.userId}/password-link`, {
+        body: { reason: 'At once, one' },
+      }),
+      superAdmin.client.request('POST', `/v1/users/${person.userId}/password-link`, {
+        body: { reason: 'At once, two' },
+      }),
+    ]);
+    expect(first?.statusCode, first?.body).toBe(201);
+    expect(second?.statusCode, second?.body).toBe(201);
+    const links = await withGlobal(async (tx) =>
+      tx.execute<{ n: number }>(sql`
+        select count(*)::int as n from iam.verifications
+        where identifier like 'reset-password:%' and value = ${person.userId}
+      `),
+    );
+    expect(links[0]?.n).toBe(1);
+  });
+});
+
+describe('iam.credential_resets', () => {
+  it('keeps every reset: no DELETE, terms frozen, and each brand sees only its own', async () => {
+    const person = await member(['sales'], { password: false });
+    await admin2.client.request('POST', `/v1/users/${person.userId}/password-link`, {
+      body: { reason: 'Database checks' },
+    });
+
+    await expectRefused(
+      withOrg({ orgId: ORG_A, userId: admin.userId }, async (tx) =>
+        tx.execute(sql`delete from iam.credential_resets where user_id = ${person.userId}`),
+      ),
+      /permission denied/,
+    );
+    await expectRefused(
+      withOrg({ orgId: ORG_A, userId: admin.userId }, async (tx) =>
+        tx.execute(sql`
+          update iam.credential_resets set reason = 'rewritten' where user_id = ${person.userId}
+        `),
+      ),
+      /CREDENTIAL_RESET_INVALID/,
+    );
+    await expectRefused(
+      withOrg({ orgId: ORG_A, userId: admin.userId }, async (tx) =>
+        tx.execute(sql`
+          insert into iam.credential_resets (org_id, user_id, kind, status, requested_by, reason)
+          values (${ORG_A}, ${person.userId}, 'password', 'approved', ${admin.userId}, 'forged')
+        `),
+      ),
+      /credential_resets_pending_has_approval|CREDENTIAL_RESET_INVALID/,
+    );
+
+    const fromB = await withOrg({ orgId: ORG_B, userId: admin.userId }, async (tx) =>
+      tx.execute<{ n: number }>(sql`
+        select count(*)::int as n from iam.credential_resets where user_id = ${person.userId}
+      `),
+    );
+    expect(fromB[0]?.n).toBe(0);
+  });
+});
+
+describe('POST /v1/users on someone from another brand (M30 A5, D-412)', () => {
+  /** A person's roles in a brand, read in that brand's own context (RLS applies). */
+  async function rolesIn(userId: string, orgId: string): Promise<string[]> {
+    const rows = await withOrg({ orgId, userId: admin.userId }, async (tx) =>
+      tx.execute<{ role: string }>(sql`
+        select role::text as role from iam.memberships where user_id = ${userId} and org_id = ${orgId}
+      `),
+    );
+    return [...rows].map((row) => row.role);
+  }
+
+  it('refuses a pre-claimed identity: one brand creates it, sets its password, the other adds it', async () => {
+    // The attack: brand A's admin invites the address of someone brand B is about to hire,
+    // redeems the invite themselves, and waits. When B's admin adds the address, the old
+    // code reused the identity and B's role opened with A's admin's password.
+    const adminB = await harness.asRole('org_admin', ORG_B);
+    const email = `preclaim_${randomUUID()}@example.invalid`;
+
+    const claimed = await admin.client.request('POST', '/v1/users', {
+      body: { email, name: 'Future hire', role: 'sales', branchIds: [] },
+    });
+    expect(claimed.statusCode, claimed.body).toBe(201);
+    const { userId, inviteToken } = json<{ userId: string; inviteToken: string }>(claimed);
+    await harness.auth.auth.api.resetPassword({
+      body: { newPassword: PASSWORD, token: inviteToken },
+    });
+
+    const added = await adminB.client.request('POST', '/v1/users', {
+      body: { email, name: 'Future hire', role: 'accounts', branchIds: [] },
+    });
+    expect(added.statusCode, added.body).toBe(403);
+    expect(json<{ code: string }>(added).code).toBe('USER_PROTECTED');
+    expect(await rolesIn(userId, ORG_B), 'no role was granted in brand B').toEqual([]);
+  });
+
+  it('counts a role that was revoked, and a password never set', async () => {
+    // Revoking the role after setting the password would otherwise launder the claim; and
+    // an invite nobody redeemed yet is still a link brand A's admin holds.
+    const adminB = await harness.asRole('org_admin', ORG_B);
+    const revoked = await member(['sales'], { password: true });
+    const switchedOff = await withOrg({ orgId: ORG_A, userId: admin.userId }, async (tx) =>
+      tx.execute<{ id: string }>(sql`
+        update iam.memberships set is_active = false
+        where user_id = ${revoked.userId} and org_id = ${ORG_A}
+        returning id
+      `),
+    );
+    expect(switchedOff.length, 'the role was revoked').toBe(1);
+    expect(await rolesIn(revoked.userId, ORG_A), 'a positive control for rolesIn').toEqual([
+      'sales',
+    ]);
+    const unredeemed = await member(['warehouse'], { password: false });
+
+    for (const person of [revoked, unredeemed]) {
+      const added = await adminB.client.request('POST', '/v1/users', {
+        body: { email: person.email, name: 'Someone', role: 'sales', branchIds: [] },
+      });
+      expect(added.statusCode, added.body).toBe(403);
+      expect(await rolesIn(person.userId, ORG_B)).toEqual([]);
+    }
+  });
+
+  it('lets a super admin add a colleague to a second brand, reusing the identity', async () => {
+    // §5 exception 4: one person, several brands, one account. Still possible, by the
+    // person who already sees every brand.
+    const colleague = await member(['warehouse'], { password: true });
+    const root = await createTestUser({ name: 'Root for brand B', isSuperAdmin: true });
+    await setPasswordFor(root.email);
+    const signedIn = await signIn(root.email);
+    await enrol(signedIn.client);
+    const entered = await signedIn.client.request('POST', '/v1/me/active-org', {
+      body: { orgId: ORG_B },
+    });
+    expect(entered.statusCode, entered.body).toBe(201);
+
+    const added = await signedIn.client.request('POST', '/v1/users', {
+      body: { email: colleague.email, name: 'Colleague', role: 'sales', branchIds: [] },
+    });
+    expect(added.statusCode, added.body).toBe(201);
+    expect(json<{ userId: string; created: boolean }>(added)).toMatchObject({
+      userId: colleague.userId,
+      created: false,
+    });
+    expect(await rolesIn(colleague.userId, ORG_B)).toEqual(['sales']);
+  });
+
+  it('lets a brand admin add a second role to someone who also works elsewhere (N5)', async () => {
+    // Already this brand's person: a second role here stays this brand's admin's to give.
+    const shared = await member(['sales'], { alsoIn: { orgId: ORG_B, role: 'sales' } });
+    const added = await admin.client.request('POST', '/v1/users', {
+      body: { email: shared.email, name: 'Shared person', role: 'marketing', branchIds: [] },
+    });
+    expect(added.statusCode, added.body).toBe(201);
+    expect(json<{ created: boolean }>(added).created).toBe(false);
+  });
+
+  it('still lets a brand admin add a second role to their own person', async () => {
+    const person = await member(['warehouse'], { password: true });
+    const added = await admin.client.request('POST', '/v1/users', {
+      body: { email: person.email, name: 'Same person', role: 'marketing', branchIds: [] },
+    });
+    expect(added.statusCode, added.body).toBe(201);
+    expect(json<{ created: boolean }>(added).created).toBe(false);
+  });
+});
+
+// --- lifecycle cleanup and permanent removal ----------------------------------------------
+
+describe('staff lifecycle', () => {
+  async function ageConfirmation(userId: string, actorId = admin.userId, expired = false) {
+    await withGlobal((tx) =>
+      tx.execute(sql`
+      update iam.verifications set created_at = now() - interval '20 seconds',
+        expires_at = ${expired ? sql`now() - interval '1 second'` : sql`expires_at`}
+      where identifier = ${`staff-removal:${ORG_A}:${actorId}:${userId}`}
+    `),
+    );
+  }
+
+  async function preview(person: Member) {
+    const response = await admin.client.request(
+      'POST',
+      `/v1/users/${person.userId}/removal-preview`,
+    );
+    expect(response.statusCode, response.body).toBe(201);
+    return json<{ token: string; warningSeconds: number }>(response);
+  }
+
+  it('releases terminals, scanners and desk settings only in this brand, keeping the extension and employee link', async () => {
+    const person = await member(['warehouse', 'sales'], {
+      alsoIn: { orgId: ORG_B, role: 'warehouse' },
+    });
+    const replacement = await member(['warehouse']);
+    const terminalIds = new Map<string, string>();
+    for (const orgId of [ORG_A, ORG_B]) {
+      await withSystem(
+        async (tx) => {
+          const [terminal] = await tx.execute<{ id: string }>(sql`
+          insert into packing.terminals (org_id, kind, name, created_by, updated_by)
+          values (${orgId}, 'packing', ${`Desk ${randomUUID().slice(0, 8)}`}, ${admin.userId}, ${admin.userId}) returning id
+        `);
+          if (terminal === undefined) throw new Error('no terminal');
+          terminalIds.set(orgId, terminal.id);
+          await tx.execute(sql`insert into packing.terminal_members (org_id, terminal_id, user_id, assigned_by)
+          values (${orgId}, ${terminal.id}, ${person.userId}, ${admin.userId})`);
+          await tx.execute(sql`insert into packing.terminal_devices
+          (org_id, terminal_id, label, token_sha256, bound_by, last_user_id, user_since)
+          values (${orgId}, ${terminal.id}, 'Shared PC', ${randomUUID().replaceAll('-', '').repeat(2)},
+            ${admin.userId}, ${person.userId}, now())`);
+          await tx.execute(sql`insert into packing.scanner_devices
+          (org_id, user_id, label, token_sha256, via, expires_at)
+          values (${orgId}, ${person.userId}, 'Phone', ${randomUUID().replaceAll('-', '').repeat(2)}, 'console', now() + interval '1 day')`);
+          await tx.execute(sql`insert into team.desk_profiles (org_id, user_id, work_types, updated_by)
+          values (${orgId}, ${person.userId}, array['orders', 'messages'], ${admin.userId})`);
+          await tx.execute(sql`insert into team.presence (org_id, user_id, last_seen_at, state)
+          values (${orgId}, ${person.userId}, now(), 'active')`);
+          const [connection] = await tx.execute<{
+            id: string;
+          }>(sql`insert into telephony.connections
+          (org_id, name, base_url, created_by, updated_by) values (${orgId}, 'Test phone', 'https://envo.example.invalid', ${admin.userId}, ${admin.userId}) returning id`);
+          await tx.execute(sql`insert into telephony.extension_assignments
+          (org_id, connection_id, extension, user_id, assigned_by)
+          values (${orgId}, ${connection?.id}, '101', ${person.userId}, ${admin.userId})`);
+          await tx.execute(sql`insert into hr.employees
+          (org_id, user_id, code, full_name, join_date, status, payout_method, created_by)
+          values (${orgId}, ${person.userId}, ${randomUUID().slice(0, 8)}, 'Historical employee', '2026-01-01', 'active', 'cash', ${admin.userId})`);
+        },
+        { orgId },
+      );
+    }
+    const response = await admin.client.request('POST', `/v1/users/${person.userId}/deactivate`, {
+      body: {},
+    });
+    expect(response.statusCode, response.body).toBe(201);
+    for (const orgId of [ORG_A, ORG_B]) {
+      await withSystem(
+        async (tx) => {
+          const [row] = await tx.execute<{
+            members: number;
+            extensions: number;
+            scanners: number;
+            working: number;
+            profile: string[];
+            paused: boolean;
+            employee_user: string | null;
+          }>(sql`select
+          (select count(*)::int from packing.terminal_members where org_id = ${orgId} and user_id = ${person.userId}) as members,
+          (select count(*)::int from telephony.extension_assignments where org_id = ${orgId} and user_id = ${person.userId}) as extensions,
+          (select count(*)::int from packing.scanner_devices where org_id = ${orgId} and user_id = ${person.userId} and revoked_at is null) as scanners,
+          (select count(*)::int from packing.terminal_devices where org_id = ${orgId} and last_user_id = ${person.userId}) as working,
+          (select work_types from team.desk_profiles where org_id = ${orgId} and user_id = ${person.userId}) as profile,
+          (select paused from team.presence where org_id = ${orgId} and user_id = ${person.userId}) as paused,
+          (select user_id from hr.employees where org_id = ${orgId} and full_name = 'Historical employee') as employee_user`);
+          expect(row).toEqual(
+            orgId === ORG_A
+              ? {
+                  members: 0,
+                  // Kept: missed calls are attributed through it, and payroll's target bonus
+                  // and mistakes read through the employee's sign-in link (ledger audit C1, W1).
+                  extensions: 1,
+                  scanners: 0,
+                  working: 0,
+                  profile: [],
+                  paused: true,
+                  employee_user: person.userId,
+                }
+              : {
+                  members: 1,
+                  extensions: 1,
+                  scanners: 1,
+                  working: 1,
+                  profile: ['orders', 'messages'],
+                  paused: false,
+                  employee_user: person.userId,
+                },
+          );
+        },
+        { orgId },
+      );
+    }
+    const assigned = await admin.client.request(
+      'PUT',
+      `/v1/terminals/${terminalIds.get(ORG_A) ?? ''}/members`,
+      {
+        body: { userIds: [replacement.userId] },
+      },
+    );
+    expect(assigned.statusCode, assigned.body).toBe(200);
+    const inactive = await admin.client.request(
+      'PUT',
+      `/v1/terminals/${terminalIds.get(ORG_A) ?? ''}/members`,
+      {
+        body: { userIds: [person.userId, replacement.userId] },
+      },
+    );
+    expect(inactive.statusCode).toBe(404);
+    // Reactivation restores access, but no previous terminal assignment.
+    expect(
+      (
+        await admin.client.request('PUT', `/v1/users/${person.userId}/roles`, {
+          body: { roles: [{ role: 'warehouse' }] },
+        })
+      ).statusCode,
+    ).toBe(200);
+  });
+
+  it('releases open orders and conversations, withdraws pending offers and preserves completed history', async () => {
+    const person = await member(['sales']);
+    const customer = await seedCustomer(ORG_A, {
+      name: 'Lifecycle buyer',
+      phoneE164: '+8801711000000',
+    });
+    const open = await seedOrder(ORG_A, {
+      customerId: customer,
+      status: 'pending',
+      lines: [],
+      assignedTo: person.userId,
+      createdBy: person.userId,
+    });
+    const done = await seedOrder(ORG_A, {
+      customerId: customer,
+      status: 'delivered',
+      lines: [],
+      assignedTo: person.userId,
+      createdBy: person.userId,
+    });
+    const offered = await seedOrder(ORG_A, { customerId: customer, status: 'pending', lines: [] });
+    const conversations = [randomUUID(), randomUUID(), randomUUID()];
+    await withSystem(
+      async (tx) => {
+        await tx.execute(sql`insert into sales.order_offers (org_id, order_id, user_id, expires_at)
+        values (${ORG_A}, ${offered.id}, ${person.userId}, now() + interval '1 minute')`);
+        const [channel] = await tx.execute<{ id: string }>(sql`insert into inbox.channels
+        (org_id, kind, external_id, enabled, updated_by) values (${ORG_A}, 'messenger', '900000000000099', true, ${admin.userId})
+        on conflict (org_id, kind) do update set updated_by = excluded.updated_by returning id`);
+        const [contact] = await tx.execute<{ id: string }>(sql`insert into inbox.contacts
+        (org_id, display_name) values (${ORG_A}, 'Lifecycle contact') returning id`);
+        for (const [index, id] of conversations.entries()) {
+          const [identity] = await tx.execute<{ id: string }>(sql`insert into inbox.identities
+          (org_id, contact_id, channel_id, external_user_id) values (${ORG_A}, ${contact?.id}, ${channel?.id}, ${id}) returning id`);
+          await tx.execute(sql`insert into inbox.conversations
+          (id, org_id, channel_id, contact_id, identity_id, status, assigned_to, assigned_at)
+          values (${id}, ${ORG_A}, ${channel?.id}, ${contact?.id}, ${identity?.id}, ${index === 1 ? 'closed' : 'open'},
+            ${index === 2 ? null : person.userId}, ${index === 2 ? sql`null` : sql`now()`})`);
+        }
+        await tx.execute(sql`insert into inbox.conversation_offers (org_id, conversation_id, user_id, expires_at)
+        values (${ORG_A}, ${conversations[2]}, ${person.userId}, now() + interval '1 minute')`);
+      },
+      { orgId: ORG_A },
+    );
+    const response = await admin.client.request('POST', `/v1/users/${person.userId}/deactivate`, {
+      body: {},
+    });
+    expect(response.statusCode, response.body).toBe(201);
+    await withSystem(
+      async (tx) => {
+        const orders = await tx.execute<{
+          id: string;
+          assigned_to: string | null;
+          created_by: string;
+        }>(sql`
+        select id, assigned_to, created_by from sales.orders where id in (${open.id}, ${done.id})`);
+        expect(orders.find((row) => row.id === open.id)).toMatchObject({
+          assigned_to: null,
+          created_by: person.userId,
+        });
+        expect(orders.find((row) => row.id === done.id)).toMatchObject({
+          assigned_to: person.userId,
+          created_by: person.userId,
+        });
+        const inbox = await tx.execute<{ id: string; assigned_to: string | null }>(sql`
+        select id, assigned_to from inbox.conversations where id in (${conversations[0]}, ${conversations[1]})`);
+        expect(inbox.find((row) => row.id === conversations[0])?.assigned_to).toBeNull();
+        expect(inbox.find((row) => row.id === conversations[1])?.assigned_to).toBe(person.userId);
+        const offers = await tx.execute<{
+          status: string;
+        }>(sql`select status from sales.order_offers where user_id = ${person.userId}
+        union all select status from inbox.conversation_offers where user_id = ${person.userId}`);
+        expect(offers.map((row) => row.status)).toEqual(['withdrawn', 'withdrawn']);
+      },
+      { orgId: ORG_A },
+    );
+  });
+
+  it('enforces the wait, name, actor and token; erases the sign-in and keeps anonymous history', async () => {
+    const person = await member(['sales']);
+    const signed = await session(person, ORG_A);
+    const terminalId = randomUUID();
+    await withSystem(
+      (tx) =>
+        tx.execute(sql`
+          insert into packing.terminals (id, org_id, kind, name, created_by, updated_by)
+          values (${terminalId}, ${ORG_A}, 'packing', ${`History ${randomUUID().slice(0, 8)}`}, ${person.userId}, ${admin.userId})
+        `),
+      { orgId: ORG_A },
+    );
+    expect(
+      (await admin.client.request('POST', `/v1/users/${person.userId}/deactivate`, { body: {} }))
+        .statusCode,
+    ).toBe(201);
+    const challenge = await preview(person);
+    const input = {
+      token: challenge.token,
+      confirmationName: 'Staff sales',
+      warningsAcknowledged: 3,
+    };
+    const path = `/v1/users/${person.userId}/remove`;
+    expect((await admin.client.request('POST', path, { body: input })).statusCode).toBe(409);
+    await ageConfirmation(person.userId);
+    expect((await admin2.client.request('POST', path, { body: input })).statusCode).toBe(409);
+    expect(
+      (await admin.client.request('POST', path, { body: { ...input, confirmationName: 'wrong' } }))
+        .statusCode,
+    ).toBe(400);
+    expect(
+      (await admin.client.request('POST', path, { body: { ...input, warningsAcknowledged: 2 } }))
+        .statusCode,
+    ).toBe(400);
+    expect(
+      (await admin.client.request('POST', path, { body: { ...input, token: '0'.repeat(64) } }))
+        .statusCode,
+    ).toBe(409);
+    const removed = await admin.client.request('POST', path, { body: input });
+    expect(removed.statusCode, removed.body).toBe(201);
+    expect((await staff()).items.some((row) => row.userId === person.userId)).toBe(false);
+    const named = await admin.client.request('GET', `/v1/staff-names?ids=${person.userId}`);
+    expect(json<{ people: { name: string }[] }>(named).people[0]?.name).toBe('Deleted staff');
+    expect((await signed.request('GET', '/v1/me')).statusCode).toBe(401);
+    expect((await signIn(person.email)).response.statusCode).not.toBe(200);
+    expect((await admin.client.request('POST', path, { body: input })).statusCode).toBe(404);
+    expect(
+      (
+        await admin.client.request('PUT', `/v1/users/${person.userId}/roles`, {
+          body: { roles: [{ role: 'sales' }] },
+        })
+      ).statusCode,
+    ).toBe(404);
+    await withSystem(
+      async (tx) => {
+        const [user] = await tx.execute<{
+          name: string;
+          email: string;
+          active: boolean;
+          accounts: number;
+        }>(sql`
+        select name, email, is_active as active, (select count(*)::int from iam.accounts where user_id = ${person.userId}) as accounts
+        from iam.users where id = ${person.userId}`);
+        expect(user).toMatchObject({ name: 'Deleted staff', active: false, accounts: 0 });
+        expect(user?.email).toMatch(/@deleted\.invalid$/);
+        const [history] = await tx.execute<{ created_by: string }>(
+          sql`select created_by from packing.terminals where id = ${terminalId}`,
+        );
+        expect(history?.created_by).toBe(person.userId);
+      },
+      { orgId: ORG_A },
+    );
+    expect(
+      (await auditRowsFor(ORG_A, person.userId)).some((row) => row.action === 'iam.user_removed'),
+    ).toBe(true);
+  });
+
+  it('refuses active staff, yourself, other-brand staff and super admins; expires confirmations', async () => {
+    const person = await member(['warehouse']);
+    expect(
+      (await admin.client.request('POST', `/v1/users/${person.userId}/removal-preview`)).statusCode,
+    ).toBe(409);
+    expect(
+      (await admin.client.request('POST', `/v1/users/${admin.userId}/removal-preview`)).statusCode,
+    ).toBe(403);
+    const other = await member(['sales'], { orgId: ORG_B });
+    expect(
+      (await admin.client.request('POST', `/v1/users/${other.userId}/removal-preview`)).statusCode,
+    ).toBe(404);
+    const shared = await member(['sales'], { alsoIn: { orgId: ORG_B, role: 'sales' } });
+    await admin.client.request('POST', `/v1/users/${shared.userId}/deactivate`, { body: {} });
+    expect(
+      (await admin.client.request('POST', `/v1/users/${shared.userId}/removal-preview`)).statusCode,
+    ).toBe(403);
+    await admin.client.request('POST', `/v1/users/${person.userId}/deactivate`, { body: {} });
+    const challenge = await preview(person);
+    await ageConfirmation(person.userId, admin.userId, true);
+    expect(
+      (
+        await admin.client.request('POST', `/v1/users/${person.userId}/remove`, {
+          body: {
+            token: challenge.token,
+            confirmationName: 'Staff warehouse',
+            warningsAcknowledged: 3,
+          },
+        })
+      ).statusCode,
+    ).toBe(409);
+  });
+});
