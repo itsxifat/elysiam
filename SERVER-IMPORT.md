@@ -3,10 +3,10 @@
 Imported on 14 November 2026 from `103.129.209.29`. The active Nginx routes and
 running Docker containers identify these as the sites using **elysiam with an a**:
 
-| Live domain | Local code | Running release | Server source |
-| --- | --- | --- | --- |
-| `elysiam.bd` | [`storefront/`](storefront/) | `7ede228a682a` | `/srv/elysium-web/releases/7ede228a682a` |
-| `erp.elysiam.bd` | Repository root | `2c17afcb983d` | `/home/enfinito/erp-brands/src/2c17afcb983d` |
+| Live domain      | Local code                   | Running release | Server source                                |
+| ---------------- | ---------------------------- | --------------- | -------------------------------------------- |
+| `elysiam.bd`     | [`storefront/`](storefront/) | `7ede228a682a`  | `/srv/elysium-web/releases/7ede228a682a`     |
+| `erp.elysiam.bd` | Repository root              | `2c17afcb983d`  | `/home/enfinito/erp-brands/src/2c17afcb983d` |
 
 The existing code, package names, documentation, and server paths retain their
 original `elysium` spelling. The domain routing determines which deployment was
@@ -14,8 +14,10 @@ imported. The older `/home/enfinito/elysiam-erp` checkout was not used: the runn
 ERP container points to the newer release listed above.
 
 The ERP stays at the repository root to preserve its workspace, CI, migration,
-and deployment scripts. The storefront is a separate npm project. Both source
-trees are unchanged from their deployed release directories.
+and deployment scripts. The storefront is a separate npm project. Application
+code retains the deployed source. Repository tooling was subsequently adapted
+for the combined checkout: separate CI checks for the storefront, scoped ERP
+formatting and linting, and dependency builds before console browser tests.
 
 ## Included files
 
@@ -84,6 +86,9 @@ Local checks completed after import:
 - ERP brand-console and mother-console translation checks: passed.
 - Every imported source file is visible to Git; dependencies remain ignored.
 
-The full ERP build and integration suite were not run. Its white-label check
-requires generated frontend builds and could not complete against the source
-snapshot alone. Production services were not used for testing.
+The list above records the initial import checks. The combined repository's CI now
+also runs the full ERP gate, builds the console's shared packages before browser
+tests, and runs the storefront's own checks in a separate job. The CI database's
+lock capacity is increased for concurrent migration suites. Older test fixtures
+were updated for the current approval policy and booking, label, packing, and
+per-lot recording workflow. Validation uses local test services.

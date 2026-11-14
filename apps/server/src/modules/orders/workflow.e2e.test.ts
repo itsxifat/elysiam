@@ -34,6 +34,7 @@ import {
   seedCustomer,
   seedOrder,
   seedStockLevel,
+  seedPrintedLabels,
 } from './orders.testing.js';
 
 /**
@@ -475,6 +476,7 @@ describe('check 2: a non-owner must acknowledge the owner, at every desk step', 
     expect(body<{ confirmed: number }>(confirmed).confirmed).toBe(1);
 
     // The hub packs Rahim's confirmed order without acknowledging anybody (D-710).
+    await seedPrintedLabels(ORG_A, order.id);
     const packed = await warehouse.client.request('POST', `/v1/orders/${order.id}/pack`);
     expect(packed.statusCode, packed.body).toBe(201);
   }, 120_000);
@@ -960,6 +962,7 @@ describe('check 5: the hub and the desk', () => {
     );
     expect((await detail(atHub.id, rahim)).hubStage).toBe('packing');
 
+    await seedPrintedLabels(ORG_A, atHub.id);
     expect((await warehouse.client.request('POST', `/v1/orders/${atHub.id}/pack`)).statusCode).toBe(
       201,
     );

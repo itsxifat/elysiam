@@ -6,7 +6,16 @@ export default [
   {
     // A script's `.d.mts` is checked by the TypeScript project that imports it (the
     // console's e2e setup imports `preview-stack.mjs`); no root project contains it.
-    ignores: [...ignores, 'apps/**', 'packages/**', 'docs/**', 'infra/**', 'scripts/**/*.d.mts'],
+    ignores: [
+      ...ignores,
+      'apps/**',
+      'packages/**',
+      'docs/**',
+      'infra/**',
+      // The standalone storefront uses its own Next.js ESLint configuration and CI job.
+      'storefront/**',
+      'scripts/**/*.d.mts',
+    ],
   },
   ...base({ tsconfigRootDir: import.meta.dirname }),
 ];

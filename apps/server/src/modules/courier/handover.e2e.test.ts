@@ -19,7 +19,9 @@ import {
   applyOrderMigrations,
   seedCustomer,
   seedStockLevel,
+  seedPrintedLabels,
   trialBalanceDifference,
+  useManualCourierBooking,
 } from '../orders/orders.testing.js';
 import { COURIER_QUEUE_DEFINITIONS } from './courier.queues.js';
 import { applyCourierMigrations, makeCourier } from './courier.testing.js';
@@ -124,6 +126,7 @@ function body<T>(response: InjectedResponse): T {
 
 /** An order taken, confirmed and (unless told otherwise) packed, through the real routes. */
 async function orderAt(status: 'confirmed' | 'packed'): Promise<{ id: string; cod: bigint }> {
+  await useManualCourierBooking(ORG_A);
   const created = await admin.client.request('POST', '/v1/orders', {
     body: {
       channel: 'phone',
@@ -139,6 +142,7 @@ async function orderAt(status: 'confirmed' | 'packed'): Promise<{ id: string; co
   const confirmed = await admin.client.request('POST', `/v1/orders/${id}/confirm`);
   expect(confirmed.statusCode, confirmed.body).toBe(201);
   if (status === 'packed') {
+    await seedPrintedLabels(ORG_A, id);
     const packed = await admin.client.request('POST', `/v1/orders/${id}/pack`);
     expect(packed.statusCode, packed.body).toBe(201);
   }
@@ -625,7 +629,7 @@ describe('the order detail offers the moves §9 allows (D-392)', () => {
       transitions: { trigger: string; to: string; requiresReason: boolean }[];
     }>(response);
     expect(detail.transitions.map((row) => row.trigger).sort()).toEqual(
-      ['cancel', 'hold', 'pack', 'ship'].sort(),
+      ['cancel', 'hold', 'pack'].sort(),
     );
     expect(detail.transitions.find((row) => row.trigger === 'hold')?.requiresReason).toBe(true);
     expect(detail.transitions.find((row) => row.trigger === 'pack')?.requiresReason).toBe(false);
@@ -647,6 +651,8 @@ describe('bulk pack and ship (D-393)', () => {
   it('moves each order on its own and reports every refusal against its id', async () => {
     const first = await orderAt('confirmed');
     const second = await orderAt('confirmed');
+    await seedPrintedLabels(ORG_A, first.id);
+    await seedPrintedLabels(ORG_A, second.id);
     const already = await orderAt('packed');
     const response = await admin.client.request('POST', '/v1/orders/bulk-transition', {
       body: { ids: [first.id, second.id, already.id], trigger: 'pack' },
@@ -729,6 +735,13 @@ describe('the read routes the settings and HR screens need (D-394 to D-396)', ()
 
 describe('Settings → Order workflow books the courier on Confirm (D-901, D-903)', () => {
   it('saves the trigger and the hours, and a Confirm then queues the parcel', async () => {
+    await withSystem(
+      (tx) =>
+        tx.execute(
+          sql`delete from org.settings where org_id = ${ORG_A} and key = 'orders.courier_booking'`,
+        ),
+      { orgId: ORG_A },
+    );
     interface Settings {
       autoAssign: boolean;
       offerSeconds: number;

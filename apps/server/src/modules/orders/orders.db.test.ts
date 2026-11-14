@@ -31,6 +31,7 @@ import {
   balancesBySubtype,
   ownRiderCourier,
   seedCustomer,
+  seedPrintedLabels,
   stockAt,
   trialBalanceDifference,
 } from './orders.testing.js';
@@ -181,6 +182,16 @@ async function takeOrder(
   return created.id;
 }
 
+async function shipOrder(
+  place: Scene,
+  orderId: string,
+  options: Parameters<OrdersService['transition']>[4] = {},
+): Promise<unknown> {
+  await seedPrintedLabels(place.orgId, orderId);
+  await orders.transition(context(place.orgId), request(), orderId, 'pack');
+  return orders.transition(context(place.orgId), request(), orderId, 'ship', options);
+}
+
 async function statusOf(orgId: string, orderId: string): Promise<string> {
   const rows = await withSystem(
     async (tx) =>
@@ -318,7 +329,7 @@ describe('check 4: supply → 3 orders → ship all → 2 delivered, 1 returned'
     expect(await stockAt(place.orgId, target, place.location)).toEqual({ onHand: 10, reserved: 6 });
 
     for (const id of ids) {
-      await orders.transition(context(place.orgId), request(), id, 'ship', {
+      await shipOrder(place, id, {
         courierId: place.courierId,
       });
     }
@@ -402,7 +413,7 @@ describe('check 5: a partial delivery', () => {
       '5000',
     );
     await orders.confirm(context(place.orgId), request(), id);
-    await orders.transition(context(place.orgId), request(), id, 'ship', {
+    await shipOrder(place, id, {
       courierId: place.courierId,
     });
 
@@ -522,7 +533,7 @@ describe('a partial delivery of a mostly-prepaid order', () => {
     );
 
     await orders.confirm(context(place.orgId), request(), id);
-    await orders.transition(context(place.orgId), request(), id, 'ship', {
+    await shipOrder(place, id, {
       courierId: place.courierId,
     });
     await orders.transition(context(place.orgId), request(), id, 'deliver_partially', {
@@ -579,7 +590,7 @@ describe('check 7: exchanging a delivered order for a different SKU', () => {
 
     const id = await takeOrder(place, [{ skuId: first, qty: 1, unitPricePoisha: '200000' }]);
     await orders.confirm(context(place.orgId), request(), id);
-    await orders.transition(context(place.orgId), request(), id, 'ship', {
+    await shipOrder(place, id, {
       courierId: place.courierId,
     });
     await orders.transition(context(place.orgId), request(), id, 'deliver');
@@ -605,7 +616,7 @@ describe('check 7: exchanging a delivered order for a different SKU', () => {
 
     const replacementId = exchanged.replacement.id;
     await orders.confirm(context(place.orgId), request(), replacementId);
-    await orders.transition(context(place.orgId), request(), replacementId, 'ship', {
+    await shipOrder(place, replacementId, {
       courierId: place.courierId,
     });
     await orders.transition(context(place.orgId), request(), replacementId, 'deliver');
@@ -722,7 +733,7 @@ describe('a return and an exchange after the average cost has moved', () => {
       await receive(place, target, 10, 40_000n);
       orderId = await takeOrder(place, [{ skuId: target, qty: 2, unitPricePoisha: '150000' }]);
       await orders.confirm(context(place.orgId), request(), orderId);
-      await orders.transition(context(place.orgId), request(), orderId, 'ship', {
+      await shipOrder(place, orderId, {
         courierId: place.courierId,
       });
       expect((await lineOf(place.orgId, orderId, target)).dispatchCost).toBe('40000');
@@ -767,7 +778,7 @@ describe('a return and an exchange after the average cost has moved', () => {
       await receive(place, second, 10, 70_000n);
       orderId = await takeOrder(place, [{ skuId: first, qty: 1, unitPricePoisha: '200000' }]);
       await orders.confirm(context(place.orgId), request(), orderId);
-      await orders.transition(context(place.orgId), request(), orderId, 'ship', {
+      await shipOrder(place, orderId, {
         courierId: place.courierId,
       });
       await orders.transition(context(place.orgId), request(), orderId, 'deliver');
@@ -788,7 +799,7 @@ describe('a return and an exchange after the average cost has moved', () => {
       replacementId = exchanged.replacement.id;
 
       await orders.confirm(context(place.orgId), request(), replacementId);
-      await orders.transition(context(place.orgId), request(), replacementId, 'ship', {
+      await shipOrder(place, replacementId, {
         courierId: place.courierId,
       });
       await orders.transition(context(place.orgId), request(), replacementId, 'deliver');
@@ -968,7 +979,7 @@ describe('what an exchange will not do', () => {
 
     const id = await takeOrder(place, [{ skuId: first, qty: 2, unitPricePoisha: '200000' }]);
     await orders.confirm(context(place.orgId), request(), id);
-    await orders.transition(context(place.orgId), request(), id, 'ship', {
+    await shipOrder(place, id, {
       courierId: place.courierId,
     });
     await orders.transition(context(place.orgId), request(), id, 'deliver');
@@ -1016,7 +1027,7 @@ describe('what an exchange will not do', () => {
 
     const id = await takeOrder(place, [{ skuId: first, qty: 2, unitPricePoisha: '200000' }]);
     await orders.confirm(context(place.orgId), request(), id);
-    await orders.transition(context(place.orgId), request(), id, 'ship', {
+    await shipOrder(place, id, {
       courierId: place.courierId,
     });
     await orders.transition(context(place.orgId), request(), id, 'deliver');
@@ -1048,7 +1059,7 @@ describe('§7’s posting window and §8’s location kinds', () => {
     await receive(place, target, 4, 40_000n);
     const id = await takeOrder(place, [{ skuId: target, qty: 1, unitPricePoisha: '100000' }]);
     await orders.confirm(context(place.orgId), request(), id);
-    await orders.transition(context(place.orgId), request(), id, 'ship', {
+    await shipOrder(place, id, {
       courierId: place.courierId,
     });
 
@@ -1116,7 +1127,7 @@ describe('the courier port’s applyTrigger', () => {
 
     const id = await takeOrder(place, [{ skuId: target, qty: 2, unitPricePoisha: '150000' }]);
     await orders.confirm(context(place.orgId), request(), id);
-    await orders.transition(context(place.orgId), request(), id, 'ship', {
+    await shipOrder(place, id, {
       courierId: place.courierId,
     });
 

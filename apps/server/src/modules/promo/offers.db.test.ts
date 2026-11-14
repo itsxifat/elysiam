@@ -22,7 +22,12 @@ import {
   type SeededSku,
 } from '../inventory/inventory.testing.js';
 import { OrdersService } from '../orders/orders.service.js';
-import { ownRiderCourier, seedCustomer, seedOrder } from '../orders/orders.testing.js';
+import {
+  ownRiderCourier,
+  seedCustomer,
+  seedOrder,
+  seedPrintedLabels,
+} from '../orders/orders.testing.js';
 import { PROMO_API, type PromoApi } from './promo.api.js';
 
 /**
@@ -625,6 +630,8 @@ describe('a return after a partial delivery, through the real transitions (ledge
     const move = (trigger: Parameters<OrdersService['transition']>[3], options = {}) =>
       orders.transition(agent(), request(), created.id, trigger, options);
     await move('confirm');
+    await seedPrintedLabels(ORG_A, created.id);
+    await move('pack');
     await move('ship', { courierId });
     await move('deliver_partially', {
       deliver: { lines: [{ skuId: item.id, deliveredQty: 2 }], collectedPoisha: '206000' },

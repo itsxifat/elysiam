@@ -14,7 +14,12 @@ import { seedProductWithSkus, warehouseId } from '../inventory/inventory.testing
 import { ORDERS_API, type OrdersApi } from './orders.api.js';
 import { OrdersModule } from './orders.module.js';
 import { OrdersService } from './orders.service.js';
-import { applyOrderMigrations, ownRiderCourier, seedCustomer } from './orders.testing.js';
+import {
+  applyOrderMigrations,
+  ownRiderCourier,
+  seedCustomer,
+  seedPrintedLabels,
+} from './orders.testing.js';
 
 /**
  * The brand's default courier is §9's, its delivery zones' (D-913), against real Postgres.
@@ -129,6 +134,8 @@ async function shippedWithNoCourier(zoneCode: string | null): Promise<string> {
     lines: [{ skuId, qty: 1, unitPricePoisha: '150000' }],
   });
   await orders.confirm(context(), request(), created.id);
+  await seedPrintedLabels(ORG_A, created.id);
+  await orders.transition(context(), request(), created.id, 'pack');
   await orders.transition(context(), request(), created.id, 'ship');
   await withSystem(
     (tx) =>

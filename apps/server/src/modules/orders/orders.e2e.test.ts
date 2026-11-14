@@ -40,6 +40,7 @@ import {
   ownRiderCourier,
   seedCustomer,
   seedStockLevel,
+  seedPrintedLabels,
   walletAccount,
 } from './orders.testing.js';
 
@@ -330,6 +331,7 @@ describe('invariant 7, over HTTP', () => {
     expect(order.codAmountPoisha).toBe('156000');
 
     for (const step of ['confirm', 'pack']) {
+      if (step === 'pack') await seedPrintedLabels(ORG_A, order.id);
       const response = await admin.client.request('POST', `/v1/orders/${order.id}/${step}`);
       expect(response.statusCode, `${step}: ${response.body}`).toBe(201);
     }
@@ -1000,6 +1002,7 @@ describe('M30: a short collection at the desk needs a reason', () => {
   it('refuses a shortfall with no reason, and takes it with one', async () => {
     const order = await takeOrder(admin, { assignedTo: sales.userId });
     for (const step of ['confirm', 'pack']) {
+      if (step === 'pack') await seedPrintedLabels(ORG_A, order.id);
       // M41 (D-710): the order is the agent's, so the admin acknowledges them to confirm it.
       const response = await admin.client.request('POST', `/v1/orders/${order.id}/${step}`, {
         headers: { 'x-acknowledge-owner': '1' },

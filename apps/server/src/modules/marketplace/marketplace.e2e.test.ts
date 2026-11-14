@@ -18,7 +18,12 @@ import {
   type RoleClient,
 } from '../../testing/http-harness.js';
 import { makeLocation, seedProductWithSkus, warehouseId } from '../inventory/inventory.testing.js';
-import { applyOrderMigrations, seedStockLevel, stockAt } from '../orders/orders.testing.js';
+import {
+  applyOrderMigrations,
+  seedStockLevel,
+  seedPrintedLabels,
+  stockAt,
+} from '../orders/orders.testing.js';
 import { ORDERS_API, type OrdersApi } from '../orders/orders.api.js';
 import { STOREFRONT_QUEUE_DEFINITIONS } from '../storefront/storefront.queues.js';
 import { MARKETPLACE_QUEUE_DEFINITIONS } from './marketplace.queues.js';
@@ -927,6 +932,9 @@ describe('order intake, held to its money (the ledger audit)', () => {
     const orders = harness.app.get<OrdersApi>(ORDERS_API);
     await withOrg({ orgId: ORG_A, userId: admin.userId }, async (tx) => {
       await orders.transition(tx, { orgId: ORG_A, userId: admin.userId }, orderId, 'confirm');
+    });
+    await seedPrintedLabels(ORG_A, orderId);
+    await withOrg({ orgId: ORG_A, userId: admin.userId }, async (tx) => {
       await orders.transition(tx, { orgId: ORG_A, userId: admin.userId }, orderId, 'pack');
     });
     const late = await handover(

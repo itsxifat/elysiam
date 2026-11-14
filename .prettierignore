@@ -1,4 +1,6 @@
 node_modules/
+# The separately managed Next.js storefront retains its deployed source format.
+storefront/
 dist/
 build/
 .next/

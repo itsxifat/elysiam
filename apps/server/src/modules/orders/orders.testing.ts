@@ -291,6 +291,64 @@ export async function seedOrder(
   );
 }
 
+/** A booked label printed for every current lot (D-928), for tests of later stages. */
+export async function seedPrintedLabels(orgId: string, orderId: string): Promise<void> {
+  await withSystem(
+    async (tx) => {
+      const [order] = await tx.execute<{ order_no: string; lot_count: number }>(sql`
+        select o.order_no, coalesce(l.lot_count, 1) as lot_count
+        from sales.orders o
+        left join packing.order_lots l on l.org_id = o.org_id and l.order_id = o.id
+        where o.org_id = ${orgId} and o.id = ${orderId}
+      `);
+      if (order === undefined) throw new Error('No order to seed printed labels for.');
+      const person = 'usr_orders_fixture';
+      await tx.execute(sql`
+        insert into iam.users (id, email, name, email_verified)
+        values (${person}, 'orders-fixture@example.invalid', 'Order fixture printer', true)
+        on conflict (id) do nothing
+      `);
+      const [terminal] = await tx.execute<{ id: string }>(sql`
+        insert into packing.terminals (org_id, kind, name, created_by, updated_by)
+        values (${orgId}, 'label', ${`Fixture ${orderId.slice(0, 8)}`}, ${person}, ${person})
+        returning id
+      `);
+      const [printer] = await tx.execute<{ id: string }>(sql`
+        insert into packing.printers
+          (org_id, terminal_id, name, connection, language, medium, width_um, height_um,
+           documents, created_by, updated_by)
+        values (${orgId}, ${terminal?.id ?? ''}, ${`Fixture ${orderId.slice(0, 8)}`}, 'browser', 'pdf',
+                '4x6', 101600, 152400, array['label']::text[], ${person}, ${person})
+        returning id
+      `);
+      for (let lot = 1; lot <= order.lot_count; lot += 1) {
+        await tx.execute(sql`
+          insert into packing.print_jobs
+            (org_id, order_id, order_no, document, lot_no, lot_count, printer_id, terminal_id,
+             source, requested_by, consignment_no, state, printed_at)
+          values (${orgId}, ${orderId}, ${order.order_no}, 'label', ${lot}, ${order.lot_count},
+                  ${printer?.id ?? ''}, ${terminal?.id ?? ''}, 'manual', ${person},
+                  ${`CN-${order.order_no}`}, 'printed', now())
+        `);
+      }
+    },
+    { orgId },
+  );
+}
+
+/** Explicit manual booking for suites that supply their own courier fixtures. */
+export async function useManualCourierBooking(orgId: string): Promise<void> {
+  await withSystem(
+    (tx) =>
+      tx.execute(sql`
+        insert into org.settings (org_id, key, value)
+        values (${orgId}, 'orders.courier_booking', '"manual"'::jsonb)
+        on conflict (org_id, key) do update set value = excluded.value
+      `),
+    { orgId },
+  );
+}
+
 /** A buyer with a default address, written directly. */
 export async function seedCustomer(
   orgId: string,

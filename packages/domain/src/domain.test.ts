@@ -132,10 +132,10 @@ describe('check 5: requests below and above a threshold behave differently', () 
   });
 });
 
-describe('check 4: the requester cannot be the approver', () => {
-  it('refuses self-approval', () => {
+describe('check 4: only pending requests can be decided (D-954)', () => {
+  it('leaves requester permissions to the permission matrix', () => {
     expect(canDecide({ requestedBy: 'u1', decidedBy: 'u1', status: 'pending' })).toMatchObject({
-      ok: false,
+      ok: true,
     });
   });
 

@@ -13,7 +13,8 @@ concurrency:
 env:
   # `pnpm verify` is the single gate for main (CLAUDE.md). CI runs exactly that
   # command so a green local run means a green CI run.
-  NODE_ENV: test
+  # Vitest selects NODE_ENV=test for its own workers. Leave it unset here so
+  # Vite and Next build production bundles during the later build stage.
   DATABASE_ADMIN_URL: postgres://postgres:postgres_dev_password@localhost:5432/elysium_test
   # Without this the harness ignores the service container below and starts
   # its own Testcontainer, which is slower and leaves the service unused.
@@ -76,7 +77,51 @@ jobs:
       - name: Create .env files from the examples
         run: pnpm run setup:env
 
+      - name: Configure PostgreSQL for parallel migration tests
+        env:
+          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+        run: |
+          # Each suite migrates a separate database; the default shared lock pool
+          # cannot hold the DDL locks for all of those migrations at once.
+          docker exec "$POSTGRES_CONTAINER" psql -U postgres -d elysium_test \
+            -c 'ALTER SYSTEM SET max_locks_per_transaction = 1024'
+          docker restart "$POSTGRES_CONTAINER"
+          for _ in {1..30}; do
+            if docker exec "$POSTGRES_CONTAINER" pg_isready -U postgres -d elysium_test; then
+              exit 0
+            fi
+            sleep 1
+          done
+          exit 1
+
       - run: pnpm run verify
+
+  storefront:
+    name: storefront
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: storefront
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: storefront/package-lock.json
+
+      - run: npm ci --no-audit --no-fund
+      - run: npm run check:no-database
+      - run: npm run lint
+      - run: npm test
+      - run: npm run build
+        env:
+          NODE_ENV: production
+          NEXT_PUBLIC_SITE_URL: https://elysiam.bd
+          ERP_MEDIA_ORIGINS: https://erp.elysiam.bd
 
   workflows:
     name: lint workflows

@@ -33,7 +33,12 @@ import {
   renderPackingSlipHtml,
 } from '../orders/order-documents.js';
 import { SAMPLE_BRAND, SAMPLE_ORDER } from '../orders/order-documents.sample.js';
-import { applyOrderMigrations, seedCustomer, seedOrder } from '../orders/orders.testing.js';
+import {
+  applyOrderMigrations,
+  seedCustomer,
+  seedOrder,
+  seedPrintedLabels,
+} from '../orders/orders.testing.js';
 import { PACKING_QUEUE_DEFINITIONS } from './packing.queues.js';
 import { ORPHAN_AFTER_MS, PackingVideoService } from './video.service.js';
 
@@ -92,7 +97,7 @@ async function confirmedOrder(
   lines: readonly { sku: Sku; qty: number }[],
   createdBy = admin.userId,
 ): Promise<{ id: string; orderNo: string }> {
-  return seedOrder(ORG_A, {
+  const order = await seedOrder(ORG_A, {
     status: 'confirmed',
     customerId,
     createdBy,
@@ -104,6 +109,8 @@ async function confirmedOrder(
       unitPricePoisha: 150_000n,
     })),
   });
+  await seedPrintedLabels(ORG_A, order.id);
+  return order;
 }
 
 type Json = Record<string, unknown>;
@@ -231,7 +238,7 @@ async function packedWithVideo(): Promise<{
   fileId: string;
 }> {
   const order = await confirmedOrder([{ sku: cap, qty: 1 }]);
-  const opened = await open(packer, { orderId: order.id });
+  const opened = await open(packer, { code: order.orderNo });
   const sessionId = sessionIdOf(opened.body);
   const video = await recordVideo(packer, sessionId);
   expect((await scan(packer, sessionId, cap.barcode)).body.outcome).toBe('accepted');
@@ -245,7 +252,7 @@ async function packedWithVideo(): Promise<{
  * number names writes it new.
  */
 async function numbered(order: { id: string }, orderNo: string): Promise<string> {
-  return withSystem(
+  const id = await withSystem(
     async (tx) => {
       const rows = await tx.execute<{ id: string }>(sql`
         insert into sales.orders (
@@ -277,6 +284,8 @@ async function numbered(order: { id: string }, orderNo: string): Promise<string>
     },
     { orgId: ORG_A },
   );
+  await seedPrintedLabels(ORG_A, id);
+  return id;
 }
 
 /** The words a refused statement failed with, from the driver's error under Drizzle's. */
@@ -430,6 +439,7 @@ describe('the packing station (M38b check 1, M38 check 5)', () => {
       'over',
       'accepted',
       'accepted',
+      'label',
     ]);
     expect(view.progress).toMatchObject({ unitsPacked: 2, complete: true });
     expect(JSON.stringify(view)).not.toMatch(/cost|wac/i);
@@ -437,7 +447,7 @@ describe('the packing station (M38b check 1, M38 check 5)', () => {
 
   it('counts a retried scan once, takes a piece back out, and refuses to finish an incomplete box', async () => {
     const order = await confirmedOrder([{ sku: cap, qty: 2 }]);
-    const sessionId = sessionIdOf((await open(packer, { orderId: order.id })).body);
+    const sessionId = sessionIdOf((await open(packer, { code: order.orderNo })).body);
     const scanId = randomUUID();
     await scan(packer, sessionId, cap.barcode, scanId);
     const retried = await scan(packer, sessionId, cap.barcode, scanId);
@@ -468,7 +478,7 @@ describe('the packing station (M38b check 1, M38 check 5)', () => {
       { sku: shirtM, qty: 1 },
       { sku: cap, qty: 1 },
     ]);
-    const sessionId = sessionIdOf((await open(packer, { orderId: order.id })).body);
+    const sessionId = sessionIdOf((await open(packer, { code: order.orderNo })).body);
     await scan(packer, sessionId, shirtM.barcode);
     await scan(packer, sessionId, cap.code);
 
@@ -497,7 +507,7 @@ describe('the packing station (M38b check 1, M38 check 5)', () => {
     const late = await scan(packer, sessionId, cap.barcode);
     expect(late.status).toBe(409);
     expect(late.body.code).toBe('PACKING_NOT_PACKABLE');
-    const reopened = await open(packer, { orderId: order.id });
+    const reopened = await open(packer, { code: order.orderNo });
     expect(sessionIdOf(reopened.body)).toBe(sessionId);
 
     // Who packed, when, and the order's history says `pack` once, by the packer.
@@ -668,7 +678,7 @@ describe('the packing station (M38b check 1, M38 check 5)', () => {
       (await call(admin, 'PUT', '/v1/packing/settings', { videoEnabled: false })).body,
     ).toMatchObject({ videoEnabled: false });
     const order = await confirmedOrder([{ sku: cap, qty: 1 }]);
-    const opened = await open(packer, { orderId: order.id });
+    const opened = await open(packer, { code: order.orderNo });
     expect(opened.body).toMatchObject({ session: { videoRequired: false }, video: 'off' });
     await call(admin, 'PUT', '/v1/packing/settings', { videoEnabled: true });
   });
@@ -698,6 +708,7 @@ describe('the packing station after the ledger audit (M38b)', () => {
         },
       ],
     });
+    await seedPrintedLabels(ORG_A, theirs.id);
     expect((await open(packer, { orderId: theirs.id })).status).toBe(200);
     let newest = '';
     for (let n = 0; n < 3; n += 1) {
@@ -723,7 +734,7 @@ describe('the packing station after the ledger audit (M38b)', () => {
   it('refuses a reseller the packing record, even of an order of their own (D-665)', async () => {
     const reseller = await harness.asRole('reseller', ORG_A);
     const order = await confirmedOrder([{ sku: cap, qty: 1 }], reseller.userId);
-    const sessionId = sessionIdOf((await open(packer, { orderId: order.id })).body);
+    const sessionId = sessionIdOf((await open(packer, { code: order.orderNo })).body);
     for (const url of [
       '/v1/packing/sessions',
       `/v1/packing/sessions/${sessionId}`,
@@ -739,7 +750,7 @@ describe('the packing station after the ledger audit (M38b)', () => {
 
   it('keeps every scan as it was written, for every role', async () => {
     const order = await confirmedOrder([{ sku: cap, qty: 1 }]);
-    const sessionId = sessionIdOf((await open(packer, { orderId: order.id })).body);
+    const sessionId = sessionIdOf((await open(packer, { code: order.orderNo })).body);
     expect((await scan(packer, sessionId, cap.barcode)).body.outcome).toBe('accepted');
     // The table's owner is held by the trigger, not only by the grants.
     expect(
@@ -768,14 +779,14 @@ describe('the packing station after the ledger audit (M38b)', () => {
       ),
     ).toMatch(/permission denied/);
     const view = (await call(packer, 'GET', `/v1/packing/sessions/${sessionId}`)).body;
-    expect((view.scans as unknown[]).length).toBe(1);
+    expect((view.scans as unknown[]).length).toBe(2);
   });
 });
 
 describe('the packing video (M38b check 2)', () => {
   it('uploads as a private packing video, attaches once, plays for the right roles only', async () => {
     const order = await confirmedOrder([{ sku: cap, qty: 1 }]);
-    const sessionId = sessionIdOf((await open(packer, { orderId: order.id })).body);
+    const sessionId = sessionIdOf((await open(packer, { code: order.orderNo })).body);
     const { videoId, fileId } = await recordVideo(packer, sessionId);
 
     // Attached once; another file for the same part is refused.
@@ -854,7 +865,7 @@ describe('the packing video (M38b check 2)', () => {
 
     // Somebody else's upload is not attached to the packer's part.
     const order = await confirmedOrder([{ sku: cap, qty: 1 }]);
-    const sessionId = sessionIdOf((await open(packer, { orderId: order.id })).body);
+    const sessionId = sessionIdOf((await open(packer, { code: order.orderNo })).body);
     const videoId = randomUUID();
     await call(packer, 'POST', `/v1/packing/sessions/${sessionId}/videos`, {
       videoId,
@@ -891,7 +902,7 @@ describe('the packing video after the ledger audit (M38b)', () => {
 
   it('refuses the same file for a second part with a 409, not a server error', async () => {
     const order = await confirmedOrder([{ sku: cap, qty: 1 }]);
-    const sessionId = sessionIdOf((await open(packer, { orderId: order.id })).body);
+    const sessionId = sessionIdOf((await open(packer, { code: order.orderNo })).body);
     const first = await recordVideo(packer, sessionId);
     const second = await register(packer, sessionId, new Date());
     expect(second.status).toBe(200);
@@ -907,7 +918,7 @@ describe('the packing video after the ledger audit (M38b)', () => {
 
   it('attaches a part’s file only for the person who recorded it, or an org admin', async () => {
     const order = await confirmedOrder([{ sku: cap, qty: 1 }]);
-    const sessionId = sessionIdOf((await open(packer, { orderId: order.id })).body);
+    const sessionId = sessionIdOf((await open(packer, { code: order.orderNo })).body);
     const part = await register(packer, sessionId, new Date());
     const videoId = String(part.body.id);
     const colleague = await harness.asRole('warehouse', ORG_A);

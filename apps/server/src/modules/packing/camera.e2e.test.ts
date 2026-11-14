@@ -25,7 +25,12 @@ import { FILES_API, type FilesApi } from '../files/files.api.js';
 import { resetFilesEnv } from '../files/files.config.js';
 import { FILES_QUEUE_DEFINITIONS } from '../files/files.queues.js';
 import { seedProductWithSkus } from '../inventory/inventory.testing.js';
-import { applyOrderMigrations, seedCustomer, seedOrder } from '../orders/orders.testing.js';
+import {
+  applyOrderMigrations,
+  seedCustomer,
+  seedOrder,
+  seedPrintedLabels,
+} from '../orders/orders.testing.js';
 import {
   CameraProcessService,
   type CameraProcessOptions,
@@ -39,8 +44,9 @@ import { PACKING_QUEUE_DEFINITIONS } from './packing.queues.js';
  * The packing table's IP camera on real Postgres (M38c, D-668 to D-676).
  *
  * The camera's password is sealed and never returned, and only an org admin sets it; the
- * station chooses a camera when it opens an order; **only the first accepted scan** starts the
- * recording, two seconds before it, and no refused scan ever does; the finish ends it and
+ * station chooses a camera when it opens an order; the lot's label starts its recording
+ * (M51, D-930), with the camera retaining the pre-roll; a refused piece never starts it;
+ * the finish ends it and
  * enqueues the cut in the same transaction; a recording left open is closed at fifteen
  * minutes; the camera process records with the opened password and never logs it, and cuts
  * the window into a private packing video filed as the session's camera part, which plays
@@ -102,7 +108,7 @@ async function withBarcodes(skus: readonly { id: string; code: string }[]): Prom
 }
 
 async function confirmedOrder(lines: readonly { sku: Sku; qty: number }[]) {
-  return seedOrder(ORG_A, {
+  const order = await seedOrder(ORG_A, {
     status: 'confirmed',
     customerId,
     createdBy: admin.userId,
@@ -114,6 +120,8 @@ async function confirmedOrder(lines: readonly { sku: Sku; qty: number }[]) {
       unitPricePoisha: 150_000n,
     })),
   });
+  await seedPrintedLabels(ORG_A, order.id);
+  return order;
 }
 
 const scan = (actor: RoleClient, sessionId: string, code: string) =>
@@ -145,18 +153,26 @@ async function addCamera(name: string, password: string | null = PASSWORD): Prom
 
 interface SessionWindow {
   camera_id: string | null;
+  recording_id: string | null;
   recording_from: Date | null;
   recording_to: Date | null;
   recording_by: string | null;
   completed_at: Date | null;
 }
 
+/** The first lot’s IP-camera window; a browser-only recording has no IP-camera window. */
 async function windowOf(sessionId: string): Promise<SessionWindow> {
   return withSystem(
     async (tx) => {
       const [row] = await tx.execute<SessionWindow & Record<string, unknown>>(sql`
-        select camera_id, recording_from, recording_to, recording_by, completed_at
-        from packing.sessions where id = ${sessionId}
+        select s.camera_id, r.id as recording_id,
+               case when r.camera_id is not null then r.started_at end as recording_from,
+               case when r.camera_id is not null then r.stopped_at end as recording_to,
+               case when r.camera_id is not null then r.started_by end as recording_by,
+               s.completed_at
+        from packing.sessions s
+        left join packing.recordings r on r.session_id = s.id and r.lot_no = 1
+        where s.id = ${sessionId}
       `);
       if (row === undefined) throw new Error('no session');
       return row;
@@ -175,18 +191,31 @@ async function cutJobs(sessionId: string): Promise<number> {
   });
 }
 
-async function firstAcceptedAt(sessionId: string): Promise<Date> {
+async function firstLabelAt(sessionId: string): Promise<Date> {
   return withSystem(
     async (tx) => {
       const [row] = await tx.execute<{ at: Date }>(sql`
         select scanned_at as at from packing.scans
-        where session_id = ${sessionId} and outcome = 'accepted' order by scanned_at limit 1
+        where session_id = ${sessionId} and outcome = 'label' order by scanned_at limit 1
       `);
       if (row === undefined) throw new Error('no accepted scan');
       return new Date(row.at);
     },
     { orgId: ORG_A },
   );
+}
+
+/** Start the lot with its label before scanning its pieces (D-930). */
+async function startLabel(sessionId: string, orderNo: string): Promise<void> {
+  const response = await scan(packer, sessionId, orderNo);
+  expect(response.status, JSON.stringify(response.body)).toBe(200);
+  expect(response.body.outcome).toBe('label');
+}
+
+async function cutRecording(service: CameraProcessService, sessionId: string) {
+  const recordingId = (await windowOf(sessionId)).recording_id;
+  if (recordingId === null) throw new Error('No lot recording to cut.');
+  return service.cut(ORG_A, sessionId, undefined, recordingId);
 }
 
 /** A camera process of the test's own, its ffmpeg the stand-in. */
@@ -402,35 +431,38 @@ describe('IP camera settings (D-668, D-669)', () => {
 });
 
 describe('the recording window (D-670, D-671): the owner’s catch', () => {
-  it('starts only at the first accepted scan, two seconds before it, never at a refused one', async () => {
+  it('starts at the label scan before accepting pieces, never at a refused piece', async () => {
     const cameraId = await addCamera(`Window ${suffix}`);
     const order = await confirmedOrder([{ sku: shirtM, qty: 2 }]);
     const opened = await call(packer, 'POST', '/v1/packing/sessions', {
-      code: order.orderNo,
+      orderId: order.id,
       cameraId,
     });
     expect(opened.status, JSON.stringify(opened.body)).toBe(200);
     const sessionId = String((opened.body.session as Json).id);
-    expect(opened.body.session).toMatchObject({ cameraId, recordingFrom: null });
+    expect(opened.body.session).toMatchObject({ cameraId });
+    expect(opened.body.recordings).toEqual([]);
 
-    // Camera ready, nothing recording: a wrong size, a wrong product and a stranger.
+    // Even a correct piece is refused until its lot's label starts the recording.
+    const unlabelled = await scan(packer, sessionId, shirtM.barcode);
+    expect(unlabelled.status).toBe(409);
+    expect(unlabelled.body.code).toBe('PACKING_LABEL_FIRST');
+    expect((await windowOf(sessionId)).recording_from).toBeNull();
+
+    // The label starts the lot's recording; pieces can then be accepted.
+    await startLabel(sessionId, order.orderNo);
     expect((await scan(packer, sessionId, shirtL.barcode)).body.outcome).toBe('wrong_variant');
     expect((await scan(packer, sessionId, cap.barcode)).body.outcome).toBe('wrong_item');
     expect((await scan(packer, sessionId, 'NO-SUCH-CODE')).body.outcome).toBe('unknown_code');
-    expect((await windowOf(sessionId)).recording_from).toBeNull();
-
-    // The first correct piece starts it, two seconds before the scan.
     const first = await scan(packer, sessionId, shirtM.barcode);
     expect(first.body.outcome).toBe('accepted');
     const started = await windowOf(sessionId);
-    const acceptedAt = await firstAcceptedAt(sessionId);
-    expect(new Date(started.recording_from ?? 0).getTime()).toBe(
-      acceptedAt.getTime() - PACKING_CAMERA_PREROLL_MS,
-    );
+    const labelAt = await firstLabelAt(sessionId);
+    expect(new Date(started.recording_from ?? 0).getTime()).toBe(labelAt.getTime());
     expect(started.recording_by).toBe(packer.userId);
-    expect((first.body.view as Json).session).toMatchObject({
-      recordingFrom: new Date(started.recording_from ?? 0).toISOString(),
-    });
+    expect((first.body.view as Json).recordings).toEqual([
+      expect.objectContaining({ startedAt: new Date(started.recording_from ?? 0).toISOString() }),
+    ]);
 
     // Later scans, accepted or refused, never move it; the camera is fixed now.
     expect((await scan(packer, sessionId, shirtM.barcode)).body.outcome).toBe('accepted');
@@ -489,6 +521,7 @@ describe('the recording window (D-670, D-671): the owner’s catch', () => {
       cameraId: null,
     });
     const sessionId = String((own.body.session as Json).id);
+    await startLabel(sessionId, order.orderNo);
     await scan(packer, sessionId, cap.barcode);
     expect((await windowOf(sessionId)).recording_from).toBeNull();
     expect((await call(packer, 'POST', `/v1/packing/sessions/${sessionId}/complete`)).status).toBe(
@@ -506,6 +539,7 @@ describe('the recording window (D-670, D-671): the owner’s catch', () => {
           .session as Json
       ).id,
     );
+    await startLabel(sessionId, order.orderNo);
     await scan(packer, sessionId, cap.barcode);
     const refusal = async (statement: ReturnType<typeof sql>) => {
       try {
@@ -521,17 +555,17 @@ describe('the recording window (D-670, D-671): the owner’s catch', () => {
     };
     expect(
       await refusal(
-        sql`update packing.sessions set recording_from = now() where id = ${sessionId}`,
+        sql`update packing.recordings set started_at = now() where session_id = ${sessionId}`,
       ),
-    ).toMatch(/set once/);
+    ).toMatch(/start are fixed/);
     expect(
       await refusal(sql`update packing.sessions set camera_id = null where id = ${sessionId}`),
-    ).toMatch(/fixed once it records|recording_camera/);
+    ).toMatch(/fixed once/);
     expect(
       await refusal(
-        sql`update packing.sessions set recording_to = recording_from + interval '20 minutes' where id = ${sessionId}`,
+        sql`update packing.recordings set stopped_at = started_at + interval '20 minutes', stop_reason = 'timed_out' where session_id = ${sessionId}`,
       ),
-    ).toMatch(/recording_window/);
+    ).toMatch(/packing_recordings_stop/);
   });
 });
 
@@ -545,6 +579,7 @@ describe('the camera process (D-672, D-673)', () => {
           .session as Json
       ).id,
     );
+    await startLabel(sessionId, order.orderNo);
     await scan(packer, sessionId, shirtM.barcode);
     const from = new Date((await windowOf(sessionId)).recording_from ?? 0).getTime();
 
@@ -584,6 +619,7 @@ describe('the camera process (D-672, D-673)', () => {
           .session as Json
       ).id,
     );
+    await startLabel(sessionId, order.orderNo);
     await scan(packer, sessionId, cap.barcode);
     await call(packer, 'POST', `/v1/packing/sessions/${sessionId}/complete`);
     const window = await windowOf(sessionId);
@@ -595,9 +631,9 @@ describe('the camera process (D-672, D-673)', () => {
     processes.push(service);
     // The buffer holds from ten seconds before the window to five after it.
     await footage(service, cameraId, from - 10_000, to + 5_000);
-    expect(await service.cut(ORG_A, sessionId)).toBe('cut');
+    expect(await cutRecording(service, sessionId)).toBe('cut');
     // Done once: a retried job changes nothing.
-    expect(await service.cut(ORG_A, sessionId)).toBe('already');
+    expect(await cutRecording(service, sessionId)).toBe('already');
 
     const record = await call(admin, 'GET', `/v1/packing/orders/${order.id}`);
     expect(record.status).toBe(200);
@@ -667,6 +703,7 @@ describe('the camera process (D-672, D-673)', () => {
           .session as Json
       ).id,
     );
+    await startLabel(sessionId, order.orderNo);
     await scan(packer, sessionId, cap.barcode);
     const from = new Date((await windowOf(sessionId)).recording_from ?? 0).getTime();
 
@@ -680,7 +717,7 @@ describe('the camera process (D-672, D-673)', () => {
     await service.prune();
     const kept = await service.bufferFor(ORG_A, cameraId).segments();
     expect(kept.some((segment) => segment.startMs <= from && segment.endMs > from)).toBe(true);
-    expect(kept.every((segment) => segment.endMs >= from)).toBe(true);
+    expect(kept.every((segment) => segment.endMs >= from - PACKING_CAMERA_PREROLL_MS)).toBe(true);
     expect(kept.length).toBeLessThan(700);
 
     // A finished packing whose camera filmed nothing: the cut says so and files nothing.
@@ -693,7 +730,7 @@ describe('the camera process (D-672, D-673)', () => {
     });
     processes.push(empty);
     const waited = Date.now();
-    expect(await empty.cut(ORG_A, sessionId)).toBe('no_footage');
+    expect(await cutRecording(empty, sessionId)).toBe('no_footage');
     expect(Date.now() - waited).toBeLessThan(10_000);
     const record = await call(admin, 'GET', `/v1/packing/orders/${order.id}`);
     expect(record.body.videos).toEqual([]);
@@ -843,6 +880,7 @@ describe('the IP camera after the ledger audit (M38c)', () => {
     });
     const sessionId = String((own.body.session as Json).id);
     expect((own.body.session as Json).cameraLocked).toBe(false);
+    await startLabel(sessionId, order.orderNo);
     expect((await scan(packer, sessionId, shirtM.barcode)).body.outcome).toBe('accepted');
     const late = await call(packer, 'POST', '/v1/packing/sessions', {
       orderId: order.id,
@@ -861,7 +899,7 @@ describe('the IP camera after the ledger audit (M38c)', () => {
     expect((await windowOf(sessionId)).camera_id).toBeNull();
   });
 
-  it('records only from the first accepted scan, on a camera that is on (N2, N4)', async () => {
+  it('records from the lot label only when its camera is on (N2, N4)', async () => {
     const cameraId = await addCamera(`Off then on ${suffix}`);
     const order = await confirmedOrder([{ sku: shirtM, qty: 2 }]);
     const sessionId = String(
@@ -876,11 +914,12 @@ describe('the IP camera after the ledger audit (M38c)', () => {
       username: 'packing',
       enabled,
     });
-    // Switched off before the first piece: that piece goes in unfilmed.
+    // Switched off before the lot label: its pieces go in without this IP camera.
     await moved(cameraId, settings(false));
+    await startLabel(sessionId, order.orderNo);
     expect((await scan(packer, sessionId, shirtM.barcode)).body.outcome).toBe('accepted');
     expect((await windowOf(sessionId)).recording_from).toBeNull();
-    // On again: the second piece is not the first, so nothing starts, and the scan is taken.
+    // On again: another piece does not restart the lot’s recording on a different source.
     await moved(cameraId, settings(true));
     const second = await scan(packer, sessionId, shirtM.barcode);
     expect(second.status, JSON.stringify(second.body)).toBe(200);
@@ -899,7 +938,7 @@ describe('the IP camera after the ledger audit (M38c)', () => {
         { orgId: ORG_A },
       ),
     ).rejects.toThrow();
-    const first = await firstAcceptedAt(sessionId);
+    const first = await firstLabelAt(sessionId);
     const twoBefore = new Date(first.getTime() - PACKING_CAMERA_PREROLL_MS).toISOString();
     await expect(
       withSystem(
@@ -977,6 +1016,7 @@ describe('the IP camera after the ledger audit (M38c)', () => {
           .session as Json
       ).id,
     );
+    await startLabel(sessionId, order.orderNo);
     await scan(packer, sessionId, cap.barcode);
     const from = new Date((await windowOf(sessionId)).recording_from ?? 0).getTime();
     const bufferRoot = await mkdtemp(path.join(tmpdir(), 'erp-cam-'));
@@ -997,7 +1037,7 @@ describe('the IP camera after the ledger audit (M38c)', () => {
     const kept = await service.bufferFor(ORG_A, cameraId).segments();
     // The waiting window from its start is all kept, even over the cap; older footage went.
     expect(kept.some((segment) => segment.startMs <= from && segment.endMs > from)).toBe(true);
-    expect(kept.every((segment) => segment.endMs >= from)).toBe(true);
+    expect(kept.every((segment) => segment.endMs >= from - PACKING_CAMERA_PREROLL_MS)).toBe(true);
     expect(await readdir(cuts)).toEqual([]);
     await switchOffCameras();
   });
@@ -1011,6 +1051,7 @@ describe('the IP camera after the ledger audit (M38c)', () => {
           .session as Json
       ).id,
     );
+    await startLabel(sessionId, order.orderNo);
     await scan(packer, sessionId, cap.barcode);
     await call(packer, 'POST', `/v1/packing/sessions/${sessionId}/complete`);
     const window = await windowOf(sessionId);
@@ -1039,7 +1080,7 @@ describe('the IP camera after the ledger audit (M38c)', () => {
     processes.push(flaky);
     await footage(flaky, cameraId, from - 3_000, to + 5_000);
     const filesBefore = await packingVideoFiles();
-    await expect(flaky.cut(ORG_A, sessionId)).rejects.toThrow(/storage went away/);
+    await expect(cutRecording(flaky, sessionId)).rejects.toThrow(/storage went away/);
     expect(await packingVideoFiles()).toEqual(filesBefore);
 
     // One segment over the ceiling: that part is filed as never arrived, the rest as video.
@@ -1050,8 +1091,8 @@ describe('the IP camera after the ledger audit (M38c)', () => {
     const middle = segments.find((segment) => segment.startMs > from);
     expect(middle).toBeDefined();
     if (middle !== undefined) await writeFile(buffer.pathOf(middle), Buffer.alloc(4 * 2048, 9));
-    expect(await big.cut(ORG_A, sessionId)).toBe('cut');
-    expect(await big.cut(ORG_A, sessionId)).toBe('already');
+    expect(await cutRecording(big, sessionId)).toBe('cut');
+    expect(await cutRecording(big, sessionId)).toBe('already');
     const record = (await call(admin, 'GET', `/v1/packing/orders/${order.id}`)).body;
     const parts = record.videos as Json[];
     expect(parts.some((part) => part.state === 'waiting')).toBe(true);
@@ -1102,6 +1143,7 @@ describe('deleting a camera and its live preview (D-683, D-684)', () => {
           .session as Json
       ).id,
     );
+    await startLabel(sessionId, order.orderNo);
     await scan(packer, sessionId, cap.barcode);
     // Recording now: refused.
     const busy = await call(admin, 'DELETE', `/v1/packing/cameras/${cameraId}`);
@@ -1117,7 +1159,7 @@ describe('deleting a camera and its live preview (D-683, D-684)', () => {
     const service = cameraProcess({ bufferRoot: await mkdtemp(path.join(tmpdir(), 'erp-cam-')) });
     processes.push(service);
     await footage(service, cameraId, from - 3_000, to + 5_000);
-    expect(await service.cut(ORG_A, sessionId)).toBe('cut');
+    expect(await cutRecording(service, sessionId)).toBe('cut');
 
     // An idle packing that chose it falls back to the desk's own camera.
     const idleOrder = await confirmedOrder([{ sku: cap, qty: 1 }]);
@@ -1290,7 +1332,7 @@ describe('deleting a camera and its live preview (D-683, D-684)', () => {
 });
 
 describe('the live view after its ledger audit', () => {
-  it('never lets a delete and a first accepted scan both win (W1)', async () => {
+  it('never lets a delete and the first label scan both win (W1)', async () => {
     for (let round = 0; round < 6; round += 1) {
       const cameraId = await addCamera(`Race ${String(round)} ${suffix}`);
       const order = await confirmedOrder([{ sku: cap, qty: 1 }]);
@@ -1301,11 +1343,11 @@ describe('the live view after its ledger audit', () => {
         ).id,
       );
       const [scanned, deleted] = await Promise.all([
-        scan(packer, sessionId, cap.barcode),
+        scan(packer, sessionId, order.orderNo),
         call(admin, 'DELETE', `/v1/packing/cameras/${cameraId}`),
       ]);
       expect(scanned.status, JSON.stringify(scanned.body)).toBe(200);
-      expect(scanned.body.outcome).toBe('accepted');
+      expect(scanned.body.outcome).toBe('label');
       const recording = (await windowOf(sessionId)).recording_from !== null;
       if (deleted.status === 200) {
         // The delete went first: the packing fell back and never records on a deleted camera.

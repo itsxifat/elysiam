@@ -24,8 +24,10 @@ import {
   balancesBySubtype,
   ownRiderCourier,
   seedCustomer,
+  seedPrintedLabels,
   stockAt,
   trialBalanceDifference,
+  useManualCourierBooking,
   walletAccount,
 } from './orders.testing.js';
 import { ReturnReasonsService } from './returns.service.js';
@@ -65,6 +67,7 @@ let inventory: InventoryApi;
 beforeAll(async () => {
   harness = await startHttpHarness('advances-db', { extraModules: [OrdersModule] });
   await applyOrderMigrations();
+  for (const orgId of Object.values(SEED_ORG_IDS)) await useManualCourierBooking(orgId);
   orders = harness.app.get(OrdersService);
   advances = harness.app.get(AdvancesService);
   returns = harness.app.get(ReturnReasonsService);
@@ -165,6 +168,10 @@ async function move(
   trigger: Parameters<OrdersService['transition']>[3],
   options: Parameters<OrdersService['transition']>[4] = {},
 ): Promise<void> {
+  if (trigger === 'ship') {
+    await seedPrintedLabels(place.orgId, orderId);
+    await orders.transition(context(place.orgId, AGENT), request(), orderId, 'pack');
+  }
   await orders.transition(context(place.orgId, AGENT), request(), orderId, trigger, options);
 }
 

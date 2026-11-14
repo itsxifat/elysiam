@@ -28,7 +28,7 @@
     "db:migrate": "pnpm --filter @elysium/db run db:migrate",
     "db:seed": "pnpm --filter @elysium/db run db:seed",
     "dev": "turbo run dev",
-    "e2e": "pnpm --filter @elysium/console run e2e",
+    "e2e": "turbo run build --filter=@elysium/console^... && pnpm --filter @elysium/console run e2e",
     "fonts:fetch": "node scripts/fetch-fonts.mjs",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
