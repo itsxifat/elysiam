@@ -72,8 +72,9 @@ shasum -a 256 -c deployment/source-checksums.sha256
 ```
 
 The manifest covers original imported files, including the Nginx snapshots. It
-excludes this import note and the import metadata. Later intentional source
-edits will naturally differ from the server snapshot.
+excludes this import note, the import metadata, and the added
+`storefront/.gitattributes` that preserves the server's original line endings in
+Git. Later intentional source edits will naturally differ from the server snapshot.
 
 Local checks completed after import:
 
